@@ -1,0 +1,23 @@
+.DS_Store
+Thumbs.db
+Desktop.ini
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+data/
+logs/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# This one-off live evaluation contains local Feishu message/chat fixtures.
+scripts/phase8a4_dual_scope_eval.py

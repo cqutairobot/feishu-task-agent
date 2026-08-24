@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feishu-task-agent"
+version = "0.1.0"
+description = "Turn Feishu group conversations into traceable tasks and reminders."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "alembic==1.19.1",
+    "httpx==0.28.1",
+    "lark-oapi==1.7.3",
+    "python-dotenv==1.2.3",
+    "SQLAlchemy==2.0.52",
+]
+
+[project.scripts]
+feishu-task-agent = "app.main:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
