@@ -6,9 +6,13 @@
 [《Linux 部署指南》](LINUX_DEPLOYMENT_GUIDE.md)。该文档同时解释常用终端、Git 和
 Docker 命令的含义、预期结果及危险操作。
 
+中国大陆阿里云 ECS 无法稳定访问 Docker Hub 时，请直接使用已经实际验收通过的
+[《阿里云 ECS 部署指南》](ALIYUN_ECS_DEPLOYMENT_GUIDE.md)：在 OrbStack 构建
+`linux/amd64` 镜像，通过 SSH 上传到 ECS，再使用 Docker Compose 启动。
+
 当前仓库提供原生 Python + Node.js 开发运行方式，适用于 macOS、Windows 和 Linux；
 同时提供面向 Linux 单机部署的生产镜像、Docker Compose 编排、同源网关和 SQLite
-持久卷。备份恢复与公网云服务器上线流程仍在后续阶段。
+持久卷，以及 SQLite 一致性备份、隔离恢复验证和阿里云 ECS 公网部署说明。
 
 ## 主要能力
 

@@ -17,6 +17,11 @@ Worker、管理后台和数据库。
 如果只是开发项目，请阅读 [README.md](README.md)；如果准备把机器人放到 Linux
 服务器长期运行，请从本文开始。
 
+如果目标是中国大陆阿里云 ECS，且 Docker Hub 访问缓慢、超时或镜像加速器缺少项目
+需要的标签，请改用已经实际验收通过的
+[《阿里云 ECS 部署指南》](ALIYUN_ECS_DEPLOYMENT_GUIDE.md)。该方案在 OrbStack
+构建 `linux/amd64` 镜像后通过 SSH 上传，不要求 ECS 从 Docker Hub 构建项目镜像。
+
 ## 1. 先理解几个名词
 
 | 名词 | 在这个项目中的含义 |
@@ -110,7 +115,8 @@ https://github.com/cqutairobot/feishu-task-agent.git
 
 - 一台 Ubuntu 22.04 服务器；
 - 一个可以使用 `sudo` 的普通登录用户；
-- 服务器可以主动访问 GitHub、Docker Hub、飞书和模型接口；
+- 服务器可以主动访问 GitHub、飞书和模型接口；如果准备在服务器构建镜像，还必须能
+  访问 Docker Hub；阿里云本地镜像上传方案不需要这一条件；
 - 已发布并审批通过的飞书企业自建应用；
 - 飞书 App ID 和 App Secret；
 - 模型接口的 API Key、OpenAI 兼容地址和模型名称；
@@ -364,6 +370,11 @@ grep '^DEPLOY_' .env
 
 ## 8. 检查、构建并启动
 
+本节是“服务器可以正常访问 Docker Hub”时的通用构建路线。中国大陆阿里云 ECS 请
+优先按照 [《阿里云 ECS 部署指南》](ALIYUN_ECS_DEPLOYMENT_GUIDE.md) 在 OrbStack
+构建并上传镜像；镜像导入后使用 `docker compose up --no-build`，不要在 ECS 重复
+构建。
+
 首先只检查 Compose 配置：
 
 ```bash
@@ -604,6 +615,10 @@ live_volume_untouched: feishu-task-agent_task-data
 阿里云 OSS 或另一台独立存储。
 
 ## 13. 从 GitHub 升级项目
+
+本节适用于服务器能够构建镜像的环境。采用阿里云本地镜像上传路线时，源码仍通过
+`git pull --ff-only` 更新，但镜像应在 OrbStack 重建、上传并通过 `docker load` 导入；
+完整步骤见 [《阿里云 ECS 部署指南》](ALIYUN_ECS_DEPLOYMENT_GUIDE.md)。
 
 不要直接在服务器上修改源码。升级前先备份：
 
