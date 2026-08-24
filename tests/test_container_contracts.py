@@ -67,6 +67,19 @@ class ContainerContractTest(unittest.TestCase):
         self.assertIn("proxy_pass http://management_api", nginx)
         self.assertIn("proxy_pass http://management_web", nginx)
 
+    def test_docker_backup_uses_sqlite_snapshot_and_verifies_copy(self) -> None:
+        script_path = ROOT / "scripts" / "docker-backup.sh"
+        script = script_path.read_text(encoding="utf-8")
+
+        self.assertTrue(script_path.stat().st_mode & 0o100)
+        self.assertIn("source.backup(backup", script)
+        self.assertIn("PRAGMA integrity_check", script)
+        self.assertIn("container_sha256", script)
+        self.assertIn("host_sha256", script)
+        self.assertIn("chmod 600", script)
+        self.assertIn("management-api is not running", script)
+        self.assertNotIn("down --volumes", script)
+
 
 if __name__ == "__main__":
     unittest.main()

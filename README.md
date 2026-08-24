@@ -297,6 +297,25 @@ SQLite 保存在 Docker 命名卷 `feishu-task-agent_task-data`，普通 `stop`�
 `restart` 和 `down` 不会删除数据。不要执行 `docker compose down --volumes`，除非明确
 要永久删除该部署数据库。`.env` 仅在运行时注入，不会复制进镜像。
 
+### 创建 SQLite 一致性备份
+
+长期服务运行时不要直接复制命名卷里的数据库文件。仓库提供的备份命令会通过
+SQLite Backup API 创建一致性快照，执行完整性检查，核对容器内外 SHA-256，并以
+`0600` 权限保存到 Docker 卷之外：
+
+```bash
+./scripts/docker-backup.sh
+```
+
+默认保存目录是 `~/feishu-task-agent-backups`。也可以指定另一个位于持久磁盘上的目录：
+
+```bash
+BACKUP_DIR=/srv/feishu-task-agent/backups ./scripts/docker-backup.sh
+```
+
+命令输出 `backup_integrity: ok`、最终路径和 SHA-256 才表示备份成功。恢复工具会在后续
+阶段加入；在此之前不要手工用备份覆盖正在运行的数据库。
+
 ## 常见问题
 
 ### 群消息没有被识别
