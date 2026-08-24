@@ -313,8 +313,20 @@ SQLite Backup API 创建一致性快照，执行完整性检查，核对容器�
 BACKUP_DIR=/srv/feishu-task-agent/backups ./scripts/docker-backup.sh
 ```
 
-命令输出 `backup_integrity: ok`、最终路径和 SHA-256 才表示备份成功。恢复工具会在后续
-阶段加入；在此之前不要手工用备份覆盖正在运行的数据库。
+命令输出 `backup_integrity: ok`、最终路径和 SHA-256 才表示备份成功。正式数据卷恢复
+工具会在后续阶段加入；在此之前不要手工用备份覆盖正在运行的数据库。
+
+可以先把任意一份备份恢复到一次性隔离卷，验证文件完整性、复制校验和、数据库迁移
+兼容性及应用读取能力。该命令不会停止服务，也不会挂载或修改正式数据卷：
+
+```bash
+./scripts/docker-verify-backup.sh \
+  ~/feishu-task-agent-backups/feishu-task-agent-20260824-190735.db
+```
+
+输出 `source_integrity: ok`、`restore_verification: ok` 和恢复后的非敏感数据计数才算
+通过；临时卷无论成功或失败都会清理。真正覆盖正式卷的灾难恢复工具仍在后续阶段
+加入。
 
 ## 常见问题
 
