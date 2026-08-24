@@ -118,9 +118,8 @@ cd ..
 5. 创建版本、发布应用并完成企业管理员审批；
 6. 把机器人加入测试群。
 
-不同飞书版本显示的权限名称可能略有差异。详细操作参考
-[`docs/phase-1c-feishu-setup.md`](docs/phase-1c-feishu-setup.md) 和
-[`docs/phase-2e-b-identity-commands.md`](docs/phase-2e-b-identity-commands.md)。
+不同飞书版本显示的权限名称可能略有差异，请以开放平台中与群消息读取、应用消息
+发送、长连接事件和卡片交互相关的权限为准。
 
 ## 5. 填写 `.env`
 
@@ -223,8 +222,8 @@ python -u -m app dev-backend
 6. 负责人私聊：`1A 已完成`，或点击任务卡片完成。
 7. 管理员私聊机器人发送：`管理后台`，使用一次性链接登录。
 
-管理员设置、成员离群和群主更换规则参考
-[`docs/phase-7c-group-administration.md`](docs/phase-7c-group-administration.md)。
+进入管理后台后可以维护当前群的额外管理员；所有成员、任务和设置均按 `chat_id`
+隔离，不会把其他群的数据混入当前群。
 
 ## 9. 运行测试
 
@@ -291,8 +290,3 @@ cd ..
 - 不要把 App Secret、模型 API Key、真实 Open ID 或群 ID 写入源码和文档。
 - 本地数据库备份可以复制 `data/feishu_task_agent.db`，但不要上传到 GitHub。
 - 上传 GitHub 前应再次执行敏感信息扫描并检查待提交文件清单。
-
-## 开发文档
-
-历史阶段设计、验收记录和后续计划保存在 [`docs/`](docs/)；当前持久路线图为
-[`docs/roadmap.md`](docs/roadmap.md)。这些文档用于继续开发，不是安装必读内容。

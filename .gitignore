@@ -19,5 +19,8 @@ logs/
 *.sqlite
 *.sqlite3
 
+# Local development plans and phase-by-phase acceptance records.
+docs/
+
 # This one-off live evaluation contains local Feishu message/chat fixtures.
 scripts/phase8a4_dual_scope_eval.py
