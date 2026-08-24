@@ -67,7 +67,7 @@ volume_created=true
 
 source_sha256="$(sha256sum "${backup_path}" | awk '{print $1}')"
 
-docker run --rm \
+docker run --rm -i \
   --user 0:0 \
   --entrypoint python \
   -e "BACKUP_FILE_NAME=${backup_name}" \
@@ -87,7 +87,11 @@ source_path = Path("/backup-source") / name
 restore_root = Path("/restore-data")
 restore_path = restore_root / "feishu_task_agent.db"
 
-source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=30)
+source = sqlite3.connect(
+    f"file:{source_path}?mode=ro&immutable=1",
+    uri=True,
+    timeout=30,
+)
 try:
     result = source.execute("PRAGMA integrity_check").fetchone()
     if result is None or result[0] != "ok":
@@ -104,7 +108,7 @@ print("source_integrity: ok")
 PY
 
 restored_sha256="$(
-  docker run --rm \
+  docker run --rm -i \
     --entrypoint python \
     -v "${restore_volume}:/restore-data:ro" \
     "${backend_image}" - <<'PY'

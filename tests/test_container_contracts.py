@@ -87,9 +87,11 @@ class ContainerContractTest(unittest.TestCase):
         self.assertTrue(script_path.stat().st_mode & 0o100)
         self.assertIn("feishu-task-agent-restore-check-", script)
         self.assertIn("source_integrity: ok", script)
+        self.assertIn("mode=ro&immutable=1", script)
         self.assertIn("restored checksum does not match backup", script)
         self.assertIn("restore_verification: ok", script)
         self.assertIn("live_volume_untouched", script)
+        self.assertEqual(script.count("docker run --rm -i"), 2)
         self.assertNotIn("-v feishu-task-agent_task-data:/restore-data", script)
         self.assertNotIn("down --volumes", script)
 
