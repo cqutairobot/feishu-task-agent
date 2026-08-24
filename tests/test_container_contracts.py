@@ -95,6 +95,30 @@ class ContainerContractTest(unittest.TestCase):
         self.assertNotIn("-v feishu-task-agent_task-data:/restore-data", script)
         self.assertNotIn("down --volumes", script)
 
+    def test_linux_deployment_guide_matches_release_commands(self) -> None:
+        guide_path = ROOT / "LINUX_DEPLOYMENT_GUIDE.md"
+        guide = guide_path.read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("LINUX_DEPLOYMENT_GUIDE.md", readme)
+        self.assertEqual(guide.count("```") % 2, 0)
+        for command in (
+            "docker compose config --quiet",
+            "docker compose build",
+            "docker compose up -d --wait --wait-timeout 180",
+            "docker compose ps --all",
+            "./scripts/docker-backup.sh",
+            "./scripts/docker-verify-backup.sh",
+        ):
+            self.assertIn(command, guide)
+        for warning in (
+            "docker compose down --volumes",
+            "docker volume rm feishu-task-agent_task-data",
+            "不要把 `.env`",
+        ):
+            self.assertIn(warning, guide)
+        self.assertNotIn("sk-ws-", guide)
+
 
 if __name__ == "__main__":
     unittest.main()
