@@ -22,7 +22,7 @@
 - 当前回归基线：完整 Python 回归与管理前端 lint、生产构建和页面契约测试
   通过。
 - 当前完成阶段：**Phase 8A-5 低成本模型生产试运行**。
-- 当前阶段：**Phase 8B-1E GitHub 首次提交与推送**，等待账号与仓库选择。
+- 当前阶段：**Phase 8B-1F GitHub 全新克隆复现验收**。
 - 当前工作方式：7E-2D 已通过页面、跨群隔离、指定管理员真实私聊和恢复默认策略
   验收；项目固定使用中国时区。面向群管理员的运行中心取消，Phase 7F 延后到正式
   部署时按需建设仅开发者可访问的运维工具。长会议纪要已正确创建全部 5 条任务；
@@ -480,12 +480,16 @@ Phase 7E-2A。
   接口可访问，一次 Ctrl+C 可统一停止；G2 完成。
 - 8B-1D 从首次 GitHub 提交候选文件生成不带 `.env`、虚拟环境、数据库、日志、依赖
   目录和构建产物的临时副本，严格按 README 从零安装与验证，完成后再进入首次推送。
-- 8B-1D 已完成：最终 223 个候选文件经过两轮独立临时目录重装；空 SQLite 迁移、
+- 8B-1D 已完成：最终 224 个候选文件经过两轮独立临时目录重装；空 SQLite 迁移、
   465 项 Python 回归、前端 lint/生产构建/2 项标准服务器页面契约均通过。删除未使用
   的 Sites/Cloudflare/D1/Drizzle 脚手架并升级兼容补丁后，`npm audit` 为 0；详情见
   [`phase-8b1d-clean-release-reproduction.md`](phase-8b1d-clean-release-reproduction.md)。
-- 8B-1E 开始前需要 GitHub 用户名、仓库名、Private/Public 和提交作者名；本机 `gh`
-  已安装但尚未登录，根仓库尚无首次提交和远程地址。
+- 8B-1E 已完成：账号 `cqutairobot` 通过 `gh auth login` 授权，本地建立 `main` 和
+  首次提交 `6b7c536`，私有仓库
+  [`cqutairobot/feishu-task-agent`](https://github.com/cqutairobot/feishu-task-agent)
+  已创建并推送；本地与远端提交一致，远端不存在 `.env`，只包含 `.env.example`。
+- 8B-1F 从 GitHub 克隆到新的隔离目录，严格依据 README 重装并运行核心检查；随后
+  使用 GitHub Actions 的 Windows Runner 验证 Windows 安装与自动化测试。
 
 #### Phase 8B-2：Docker Compose 单机部署
 

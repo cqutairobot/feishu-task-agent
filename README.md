@@ -49,10 +49,10 @@ npm --version
 
 ## 1. 克隆仓库
 
-仓库创建后，会把下面的占位地址替换为真实 GitHub 地址：
+使用下面的地址克隆私有仓库；首次操作时 GitHub 会要求使用已获授权的账号：
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/feishu-task-agent.git
+git clone https://github.com/cqutairobot/feishu-task-agent.git
 cd feishu-task-agent
 ```
 

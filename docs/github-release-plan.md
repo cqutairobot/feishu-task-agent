@@ -2,7 +2,7 @@
 
 本计划先建立一个可以从全新克隆目录复现的原生开发版本，暂不引入 Docker。
 
-## G1：仓库与安装入口整理 — 已实现，等待用户检查 README
+## G1：仓库与安装入口整理 — 已完成
 
 - 将根 README 改为面向使用者的 macOS、Windows 和 Linux 安装入口。
 - 开发历史保留在 `docs/`，不混入安装主流程。
@@ -30,18 +30,21 @@
 - 从不包含 `.venv`、数据库和构建产物的干净目录按 README 重装。
 - 检查 Git 待提交清单和敏感信息扫描结果。
 
-最终 223 个候选文件已完成两轮独立临时目录重装。空数据库迁移、465 项 Python
+最终 224 个候选文件已完成两轮独立临时目录重装。空数据库迁移、465 项 Python
 回归、前端 lint/生产构建/2 项服务器页面契约均通过；清理无用前端脚手架并升级兼容
 补丁后，`npm audit` 为 0。详情见
 [`phase-8b1d-clean-release-reproduction.md`](phase-8b1d-clean-release-reproduction.md)。
 
-## G4：GitHub 首次推送 — 等待账号与仓库选择
+## G4：GitHub 首次推送 — 已完成
 
-- 由用户确认 GitHub 用户名、仓库名和 Private/Public。
-- 用户通过浏览器或 `gh auth login` 授权，不在聊天中提供密码或 Token。
-- 建立首次提交并推送，随后把 README 的克隆占位地址替换为真实地址。
+- 用户通过 `gh auth login` 授权账号 `cqutairobot`，未在聊天中提供密码或 Token。
+- 建立本地 `main` 分支和首次提交 `6b7c536`，提交作者仅配置在当前仓库。
+- 创建并推送私有仓库
+  [`cqutairobot/feishu-task-agent`](https://github.com/cqutairobot/feishu-task-agent)。
+- 本地与远端提交一致；远端不存在 `.env`，只包含可公开填写的 `.env.example`。
+- README 的克隆命令已替换为真实仓库地址。
 
-## G5：GitHub 干净克隆验收
+## G5：GitHub 干净克隆验收 — 当前阶段
 
 - 从 GitHub 克隆到新目录，只创建新的 `.env`。
 - 完全按照 README 安装、启动并完成真实飞书核心验收。

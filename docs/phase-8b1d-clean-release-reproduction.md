@@ -3,7 +3,7 @@
 ## 发布边界
 
 使用 `git ls-files --cached --others --exclude-standard` 生成首次提交候选，而不是复制
-整个开发目录。最终候选包含 223 个文件，明确排除：
+整个开发目录。最终候选包含 224 个文件，明确排除：
 
 - `.env` 和本机真实配置；
 - `.venv`、`node_modules`；
@@ -38,10 +38,11 @@ Vinext、Vite、React 与 React Server DOM 升级到兼容修复版本，并使�
 页面契约测试同步改为真实启动 `vinext start` 后通过 HTTP 验证，覆盖更接近后续原生
 和容器部署的运行路径。
 
-## G4 前置状态
+## G4 后续结果
 
-- 当前根 Git 仓库尚无首次提交和远程地址。
-- 本机已安装 GitHub CLI，但尚未登录 GitHub。
-- Git 提交用户名和邮箱尚未在此仓库配置。
-- 首次推送前需要用户确认 GitHub 用户名、仓库名和 Private/Public，并通过
-  `gh auth login` 完成授权。
+- 用户通过 `gh auth login` 授权账号 `cqutairobot`。
+- 本地建立 `main` 分支和首次提交 `6b7c536`，提交作者身份仅配置在当前仓库。
+- 私有仓库
+  [`cqutairobot/feishu-task-agent`](https://github.com/cqutairobot/feishu-task-agent)
+  已创建并完成首次推送。
+- 本地与远端提交一致；远端确认不存在 `.env`，只包含 `.env.example`。
