@@ -132,7 +132,7 @@ class DatabaseSettings:
 
 @dataclass(frozen=True, slots=True)
 class ManagementWebSettings:
-    """Local-only Phase 7B management login and read API settings."""
+    """Management login and API listener settings."""
 
     enabled: bool = False
     public_base_url: str = "http://127.0.0.1:8000"
@@ -172,9 +172,15 @@ class ManagementWebSettings:
         bind_host = values.get(
             "MANAGEMENT_WEB_BIND_HOST", "127.0.0.1"
         ).strip()
-        if bind_host not in {"127.0.0.1", "localhost", "::1"}:
+        if bind_host not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+            "0.0.0.0",
+            "::",
+        }:
             raise SettingsError(
-                "MANAGEMENT_WEB_BIND_HOST must be a loopback address in Phase 7B"
+                "MANAGEMENT_WEB_BIND_HOST must be a loopback or wildcard address"
             )
         try:
             port = int(values.get("MANAGEMENT_WEB_PORT", "8000").strip())

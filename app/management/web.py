@@ -970,7 +970,8 @@ def run_management_server(
     )
     print(
         f"Management server started at {settings.public_base_url}; "
-        "loopback-only; press Ctrl+C to stop.",
+        f"bound to {settings.bind_host}:{settings.port}; "
+        "press Ctrl+C to stop.",
         flush=True,
     )
     try:

@@ -157,10 +157,17 @@ class ManagementWebSettingsTest(unittest.TestCase):
         self.assertEqual(settings.public_base_url, "http://127.0.0.1:8000")
         self.assertEqual(settings.frontend_url, "http://127.0.0.1:3000")
 
-    def test_rejects_non_loopback_bind_and_non_origin_urls(self) -> None:
-        with self.assertRaisesRegex(SettingsError, "loopback"):
+    def test_allows_container_wildcard_bind(self) -> None:
+        settings = ManagementWebSettings.from_mapping(
+            {"MANAGEMENT_WEB_BIND_HOST": "0.0.0.0"}
+        )
+
+        self.assertEqual(settings.bind_host, "0.0.0.0")
+
+    def test_rejects_unknown_bind_and_non_origin_urls(self) -> None:
+        with self.assertRaisesRegex(SettingsError, "loopback or wildcard"):
             ManagementWebSettings.from_mapping(
-                {"MANAGEMENT_WEB_BIND_HOST": "0.0.0.0"}
+                {"MANAGEMENT_WEB_BIND_HOST": "192.0.2.10"}
             )
         with self.assertRaisesRegex(SettingsError, "plain HTTP"):
             ManagementWebSettings.from_mapping(

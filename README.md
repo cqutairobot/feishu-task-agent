@@ -2,8 +2,9 @@
 
 一个从飞书群聊中识别任务、跟踪负责人和截止时间，并自动私聊提醒的任务机器人。
 
-当前仓库提供原生 Python + Node.js 开发运行方式，适用于 macOS、Windows 和 Linux。
-Docker、OrbStack 演练和云服务器部署将在后续阶段加入，不是本页当前安装流程的一部分。
+当前仓库提供原生 Python + Node.js 开发运行方式，适用于 macOS、Windows 和 Linux；
+同时提供面向 Linux 单机部署的生产镜像、Docker Compose 编排、同源网关和 SQLite
+持久卷。备份恢复与公网云服务器上线流程仍在后续阶段。
 
 ## 主要能力
 
@@ -244,6 +245,57 @@ npm audit
 
 `npm test` 会执行一次生产构建并通过标准 Vinext 生产服务器验证渲染结果。首次发布前
 要求 `npm audit` 报告 0 个已知漏洞。
+
+## 10. Docker Compose 单机运行
+
+Docker Compose 会运行一次数据库迁移，并分别启动 Listener、三个 Worker、管理 API、
+管理前端和同源网关。开始前先停止原生 `python -m app dev`，避免同一个机器人被两套
+Listener 同时连接。
+
+本机 Docker Desktop 默认可以使用 `.env.example` 中的部署入口：
+
+```dotenv
+DEPLOY_PUBLIC_URL=http://127.0.0.1:8080
+DEPLOY_BIND_HOST=127.0.0.1
+DEPLOY_HTTP_PORT=8080
+DEPLOY_IMAGE_TAG=local
+```
+
+OrbStack Linux 虚拟机需要允许 Mac 访问虚拟机端口，并把公开地址换成实际机器名：
+
+```dotenv
+DEPLOY_PUBLIC_URL=http://feishu-server.orb.local:8080
+DEPLOY_BIND_HOST=0.0.0.0
+DEPLOY_HTTP_PORT=8080
+DEPLOY_IMAGE_TAG=local
+```
+
+校验、构建并后台启动：
+
+```bash
+docker compose config --quiet
+docker compose build
+docker compose up -d
+docker compose ps --all
+```
+
+预期 `migrate` 为 `Exited (0)`，其他七个服务为 `Up` 或 `healthy`。访问：
+
+- 完整管理入口：`DEPLOY_PUBLIC_URL`；
+- 健康检查：`DEPLOY_PUBLIC_URL/health`。
+
+常用运维命令：
+
+```bash
+docker compose logs --follow --tail 100
+docker compose stop
+docker compose start
+docker compose down
+```
+
+SQLite 保存在 Docker 命名卷 `feishu-task-agent_task-data`，普通 `stop`、`start`、
+`restart` 和 `down` 不会删除数据。不要执行 `docker compose down --volumes`，除非明确
+要永久删除该部署数据库。`.env` 仅在运行时注入，不会复制进镜像。
 
 ## 常见问题
 

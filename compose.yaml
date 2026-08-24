@@ -1,0 +1,144 @@
+name: feishu-task-agent
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+x-backend-service: &backend-service
+  image: feishu-task-agent-backend:${DEPLOY_IMAGE_TAG:-local}
+  env_file:
+    - .env
+  environment:
+    DATABASE_URL: sqlite:////app/data/feishu_task_agent.db
+    MANAGEMENT_WEB_BIND_HOST: 0.0.0.0
+    MANAGEMENT_WEB_PUBLIC_BASE_URL: ${DEPLOY_PUBLIC_URL:-http://127.0.0.1:8080}
+    MANAGEMENT_WEB_FRONTEND_URL: ${DEPLOY_PUBLIC_URL:-http://127.0.0.1:8080}
+    TZ: Asia/Shanghai
+  volumes:
+    - task-data:/app/data
+  networks:
+    - app-network
+  init: true
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging: *default-logging
+
+services:
+  migrate:
+    <<: *backend-service
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["db-status"]
+    restart: "no"
+
+  listener:
+    <<: *backend-service
+    command: ["listen"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  detection-worker:
+    <<: *backend-service
+    command: ["worker", "--forever"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  reminder-worker:
+    <<: *backend-service
+    command: ["reminder-worker", "--forever"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  notification-worker:
+    <<: *backend-service
+    command: ["task-notification-worker", "--forever"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  management-api:
+    <<: *backend-service
+    command: ["management-server"]
+    restart: unless-stopped
+    expose:
+      - "8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+  management-web:
+    image: feishu-task-agent-web:${DEPLOY_IMAGE_TAG:-local}
+    build:
+      context: management-web
+      dockerfile: Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+      TZ: Asia/Shanghai
+    expose:
+      - "3000"
+    networks:
+      - app-network
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *default-logging
+
+  gateway:
+    image: feishu-task-agent-gateway:${DEPLOY_IMAGE_TAG:-local}
+    build:
+      context: gateway
+      dockerfile: Dockerfile
+    ports:
+      - "${DEPLOY_BIND_HOST:-127.0.0.1}:${DEPLOY_HTTP_PORT:-8080}:8080"
+    networks:
+      - app-network
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      management-api:
+        condition: service_healthy
+      management-web:
+        condition: service_healthy
+    logging: *default-logging
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  task-data:

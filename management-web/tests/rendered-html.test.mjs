@@ -89,6 +89,7 @@ test("browser API requests rely on the HttpOnly session cookie", async () => {
     "utf8",
   );
   assert.match(source, /credentials:\s*"include"/);
+  assert.match(source, /NEXT_PUBLIC_MANAGEMENT_API_URL \?\? ""/);
   assert.match(source, /\/api\/chats/);
   assert.match(source, /飞书名称：/);
   assert.match(source, /resource: "deadline" \| "title" \| "assignees" \| "status"/);

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const API_ORIGIN = process.env.NEXT_PUBLIC_MANAGEMENT_API_URL ?? "http://127.0.0.1:8000";
+const API_ORIGIN = process.env.NEXT_PUBLIC_MANAGEMENT_API_URL ?? "";
 const LAST_CHAT_STORAGE_KEY = "lab-task-console:last-chat-id";
 const TASK_PAGE_SIZE = 10;
 

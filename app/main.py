@@ -439,7 +439,7 @@ def _build_parser() -> argparse.ArgumentParser:
     management_task.add_argument("--task-id", type=int, required=True)
     commands.add_parser(
         "management-server",
-        help="run the loopback-only read management HTTP service",
+        help="run the authenticated management HTTP service",
     )
     return parser
 
