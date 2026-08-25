@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from enum import StrEnum
 import json
 import math
@@ -282,6 +283,7 @@ class TaskRepository:
                 )
             else:
                 was_pending = task.status == TaskStatus.PENDING.value
+                self._refine_existing_task(task, candidate)
                 task.confidence = max(task.confidence, candidate.confidence)
                 if (
                     task.status == TaskStatus.PENDING.value
@@ -652,19 +654,18 @@ class TaskRepository:
         candidate: TaskCandidate,
         evidence_messages: tuple[Message, ...],
     ) -> Task | None:
-        deadline_condition = (
-            Task.deadline.is_(None)
-            if candidate.deadline is None
-            else Task.deadline == candidate.deadline
-        )
+        deadline_conditions = [Task.deadline == candidate.deadline]
+        if candidate.deadline is not None:
+            # A later message may supply the deadline for an already-created
+            # open task. This is a monotonic refinement, not a new assignment.
+            deadline_conditions.append(Task.deadline.is_(None))
         possible = list(
             session.scalars(
                 select(Task)
                 .join(TaskEvidence, TaskEvidence.task_id == Task.id)
                 .where(
                     Task.chat_id == chat_id,
-                    Task.normalized_title == _normalize_title(candidate.title),
-                    deadline_condition,
+                    or_(*deadline_conditions),
                     TaskEvidence.message_db_id.in_(
                         tuple(message.id for message in evidence_messages)
                     ),
@@ -684,12 +685,30 @@ class TaskRepository:
                 for assignee in _task_assignee_snapshots(task)
             }
             == candidate_open_ids
+            and _candidate_matches_existing_task(task, candidate)
         ]
         if len(matches) > 1:
             raise TaskMaterializationError(
                 "candidate ambiguously matches multiple existing tasks"
             )
         return None if not matches else matches[0]
+
+    @staticmethod
+    def _refine_existing_task(task: Task, candidate: TaskCandidate) -> None:
+        """Apply only safe, monotonic details learned by a later run."""
+
+        if task.deadline is not None or candidate.deadline is None:
+            return
+        if task.status not in {
+            TaskStatus.PENDING.value,
+            TaskStatus.TODO.value,
+        }:
+            return
+        task.deadline = candidate.deadline
+        if candidate.confidence >= task.confidence:
+            task.title = candidate.title
+            task.normalized_title = _normalize_title(candidate.title)
+            task.description = candidate.description
 
     def _create_task(
         self,
@@ -868,6 +887,63 @@ def _candidate_owner_names(payload: str) -> dict[str, str]:
 
 def _normalize_title(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _candidate_matches_existing_task(
+    task: Task, candidate: TaskCandidate
+) -> bool:
+    candidate_title = _normalize_title(candidate.title)
+    is_deadline_refinement = (
+        task.deadline is None and candidate.deadline is not None
+    )
+    if is_deadline_refinement and task.status not in {
+        TaskStatus.PENDING.value,
+        TaskStatus.TODO.value,
+    }:
+        return False
+    if task.normalized_title == candidate_title:
+        return True
+    if not is_deadline_refinement:
+        return False
+    return _titles_are_likely_refinement(
+        task.normalized_title,
+        candidate_title,
+    )
+
+
+def _titles_are_likely_refinement(left: str, right: str) -> bool:
+    """Conservatively recognize a richer title for one unfinished task.
+
+    Shared evidence and an identical assignee set are already required by the
+    caller. Requiring both sequence similarity and several shared trigrams
+    avoids treating short generic phrases such as ``登录页`` and ``登录接口`` as
+    the same task merely because a later candidate adds a deadline.
+    """
+
+    left_compact = "".join(left.split())
+    right_compact = "".join(right.split())
+    if left_compact == right_compact:
+        return True
+    if min(len(left_compact), len(right_compact)) < 5:
+        return False
+    similarity = SequenceMatcher(
+        None,
+        left_compact,
+        right_compact,
+        autojunk=False,
+    ).ratio()
+    if similarity < 0.65:
+        return False
+    left_trigrams = _character_ngrams(left_compact, size=3)
+    right_trigrams = _character_ngrams(right_compact, size=3)
+    return len(left_trigrams & right_trigrams) >= 3
+
+
+def _character_ngrams(value: str, *, size: int) -> set[str]:
+    return {
+        value[index : index + size]
+        for index in range(len(value) - size + 1)
+    }
 
 
 def _aware_utc(value: datetime, field: str) -> datetime:

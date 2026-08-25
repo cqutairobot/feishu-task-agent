@@ -300,6 +300,126 @@ class TaskMaterializationTest(unittest.TestCase):
         self.assertEqual(result.created_task_count, 1)
         self.assertEqual(len(self.runtime.tasks.list_tasks("oc_a")), 2)
 
+    def test_later_deadline_refines_same_open_task_instead_of_duplicating(
+        self,
+    ) -> None:
+        first_title = "补充ResNet50 baseline不同随机种子实验结果"
+        refined_title = "补充ResNet50不同随机种子实验结果并上传至实验服务器"
+        first_run = self._completed_run(
+            "oc_a",
+            "om_a2",
+            ("om_a1", "om_a2"),
+            [
+                self._candidate(
+                    confidence=0.90,
+                    title=first_title,
+                    deadline=None,
+                    evidence=["om_a2"],
+                )
+            ],
+        )
+        first = self.runtime.tasks.materialize_run(
+            first_run,
+            materialized_at=self.now,
+        )
+        self._ingest(
+            "oc_a",
+            "om_a4",
+            "ou_teacher",
+            "好，那明天下午6点前跑完，把均值、方差和日志路径上传。",
+        )
+        second_run = self._completed_run(
+            "oc_a",
+            "om_a4",
+            ("om_a1", "om_a2", "om_a4"),
+            [
+                self._candidate(
+                    confidence=0.95,
+                    title=refined_title,
+                    deadline="2026-08-23T18:00:00+08:00",
+                    evidence=["om_a2", "om_a4"],
+                )
+            ],
+        )
+
+        second = self.runtime.tasks.materialize_run(
+            second_run,
+            materialized_at=self.now + timedelta(minutes=2),
+        )
+
+        self.assertEqual(second.created_task_count, 0)
+        self.assertEqual(second.reused_task_count, 1)
+        self.assertEqual(second.task_ids, first.task_ids)
+        self.assertEqual(len(self.runtime.tasks.list_tasks("oc_a")), 1)
+        task_id = first.task_ids[0]
+        task = self.runtime.tasks.get_task(task_id)
+        self.assertEqual(task.title, refined_title)
+        self.assertEqual(
+            task.deadline,
+            datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(task.confidence, 0.95)
+        self.assertEqual(
+            self.runtime.tasks.evidence_message_ids(task_id),
+            ("om_a2", "om_a4"),
+        )
+        self.assertEqual(
+            self.runtime.tasks.source_candidates(task_id),
+            ((first_run, 0), (second_run, 0)),
+        )
+        self.assertEqual(
+            len(self.runtime.reminders.list_for_task(task_id)),
+            4,
+        )
+        with Session(self.runtime.engine) as session:
+            notices = session.scalars(select(TaskNotification)).all()
+        self.assertEqual(len(notices), 1)
+
+    def test_later_deadline_does_not_merge_a_different_task(self) -> None:
+        first_run = self._completed_run(
+            "oc_a",
+            "om_a2",
+            ("om_a1", "om_a2"),
+            [
+                self._candidate(
+                    title="完成登录页适配",
+                    deadline=None,
+                    evidence=["om_a2"],
+                )
+            ],
+        )
+        self.runtime.tasks.materialize_run(
+            first_run,
+            materialized_at=self.now,
+        )
+        self._ingest(
+            "oc_a",
+            "om_a4",
+            "ou_teacher",
+            "另外把登录接口适配也在明天下午6点前完成。",
+        )
+        second_run = self._completed_run(
+            "oc_a",
+            "om_a4",
+            ("om_a1", "om_a2", "om_a4"),
+            [
+                self._candidate(
+                    title="完成登录接口适配",
+                    deadline="2026-08-23T18:00:00+08:00",
+                    evidence=["om_a2", "om_a4"],
+                )
+            ],
+        )
+
+        second = self.runtime.tasks.materialize_run(
+            second_run,
+            materialized_at=self.now + timedelta(minutes=2),
+        )
+
+        self.assertEqual(second.created_task_count, 1)
+        self.assertEqual(second.reused_task_count, 0)
+        self.assertEqual(len(self.runtime.tasks.list_tasks("oc_a")), 2)
+
     def test_stronger_repeated_detection_promotes_pending_to_todo(self) -> None:
         first_run = self._completed_run(
             "oc_a",

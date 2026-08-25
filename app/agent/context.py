@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -107,16 +107,20 @@ class TaskDetectionContextBuilder:
         *,
         default_limit: int = 30,
         max_content_characters: int = 12_000,
+        max_idle_gap: timedelta = timedelta(minutes=15),
         task_scope_resolver: Callable[[str], str] | None = None,
     ) -> None:
         if default_limit < 1:
             raise ValueError("default_limit must be at least 1")
         if max_content_characters < 1:
             raise ValueError("max_content_characters must be at least 1")
+        if max_idle_gap <= timedelta(0):
+            raise ValueError("max_idle_gap must be positive")
         self._messages = messages
         self._aliases = aliases
         self._default_limit = default_limit
         self._max_content_characters = max_content_characters
+        self._max_idle_gap = max_idle_gap
         self._task_scope_resolver = task_scope_resolver
 
     def build(
@@ -132,6 +136,7 @@ class TaskDetectionContextBuilder:
             trigger_message_id,
             limit=self._default_limit if limit is None else limit,
         )
+        window = self._most_recent_conversation_segment(window)
         selected = self._fit_content_budget(window)
         if not selected or selected[-1].message_id != trigger_message_id:
             raise ValueError("trigger message is not an eligible human message")
@@ -189,6 +194,20 @@ class TaskDetectionContextBuilder:
             focus_message_ids=focus_message_ids,
             task_scope=task_scope,
         )
+
+    def _most_recent_conversation_segment(
+        self, window: list[ConversationLine]
+    ) -> list[ConversationLine]:
+        """Drop stale topics before the most recent chat inactivity gap."""
+
+        segment_start = 0
+        for index in range(1, len(window)):
+            idle_gap = (
+                window[index].created_at - window[index - 1].created_at
+            )
+            if idle_gap > self._max_idle_gap:
+                segment_start = index
+        return window[segment_start:]
 
     def _fit_content_budget(
         self, window: list[ConversationLine]

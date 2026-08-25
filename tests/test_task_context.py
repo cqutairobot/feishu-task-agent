@@ -2,7 +2,7 @@
 
 from contextlib import redirect_stdout
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import json
 from pathlib import Path
@@ -155,6 +155,63 @@ class TaskDetectionContextTest(unittest.TestCase):
         self.assertEqual(
             [message.message_id for message in context.messages], ["om_a3"]
         )
+
+    def test_idle_gap_starts_a_new_conversation_segment(self) -> None:
+        self._ingest(
+            event_id="evt_a5",
+            message_id="om_a5",
+            chat_id="oc_a",
+            open_id="ou_teacher",
+            text="MobileNetV3 还缺关闭 SE 模块的结果。",
+            timestamp="1787384040000",
+        )
+        self._ingest(
+            event_id="evt_a6",
+            message_id="om_a6",
+            chat_id="oc_a",
+            open_id="ou_wang",
+            text="我来补。",
+            timestamp="1787384070000",
+        )
+
+        context = self._builder().build("oc_a", "om_a6")
+
+        self.assertEqual(
+            [message.message_id for message in context.messages],
+            ["om_a5", "om_a6"],
+        )
+        self.assertNotIn(
+            "这个实验还缺一个 baseline",
+            [message.content for message in context.messages],
+        )
+
+    def test_idle_gap_can_be_adjusted_for_a_longer_conversation(self) -> None:
+        self._ingest(
+            event_id="evt_a5",
+            message_id="om_a5",
+            chat_id="oc_a",
+            open_id="ou_teacher",
+            text="半小时后补充同一讨论。",
+            timestamp="1787384040000",
+        )
+        context = TaskDetectionContextBuilder(
+            self.runtime.repository,
+            self.runtime.aliases,
+            max_idle_gap=timedelta(hours=1),
+        ).build("oc_a", "om_a5")
+
+        self.assertEqual(
+            [message.message_id for message in context.messages],
+            ["om_a1", "om_a2", "om_a3", "om_a4", "om_a5"],
+        )
+
+    def test_idle_gap_must_be_positive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_idle_gap"):
+            TaskDetectionContextBuilder(
+                self.runtime.repository,
+                self.runtime.aliases,
+                max_idle_gap=timedelta(0),
+            )
 
     def test_chat_task_scope_is_included_in_model_context(self) -> None:
         context = TaskDetectionContextBuilder(
