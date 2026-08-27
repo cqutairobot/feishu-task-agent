@@ -60,7 +60,9 @@ export function DashboardClient() {
   const [searchInput, setSearchInput] = useState("");
   const [page, setPage] = useState(1);
   const [detail, setDetail] = useState<TaskDetail | null>(null);
+  const [mergeTargets, setMergeTargets] = useState<Task[]>([]);
   const [creating, setCreating] = useState(false);
+  const [refreshVersion, setRefreshVersion] = useState(0);
   const [loading, setLoading] = useState(true);
   const [administrationLoading, setAdministrationLoading] = useState(false);
   const [mutatingOpenId, setMutatingOpenId] = useState("");
@@ -70,6 +72,15 @@ export function DashboardClient() {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
+  const activeChatId = useRef("");
+  const dashboardRequest = useRef(0);
+  const administrationRequest = useRef(0);
+  const settingsRequest = useRef(0);
+  const taskDetailRequest = useRef(0);
+  const taskDetailAbort = useRef<AbortController | null>(null);
+  const taskCreationRequest = useRef(0);
+  const taskMutationRequest = useRef(0);
+  const summaryRequest = useRef(0);
 
   const handleFailure = useCallback((reason: unknown, fallback: string) => {
     if (reason instanceof UnauthorizedError) setUnauthorized(true);
@@ -88,7 +99,8 @@ export function DashboardClient() {
   }, []);
 
   useEffect(() => {
-    apiRequest<Chat[]>("/api/chats")
+    const controller = new AbortController();
+    apiRequest<Chat[]>("/api/chats", { signal: controller.signal })
       .then((items) => {
         const requested = readTaskViewState().chatId;
         const remembered = readLastChatId();
@@ -97,52 +109,89 @@ export function DashboardClient() {
           : items.some((chat) => chat.chat_id === remembered)
             ? remembered
           : items[0]?.chat_id ?? "";
-        setChats(items); setChatId(nextChatId); writeTaskViewState({ chatId: nextChatId });
+        activeChatId.current = nextChatId;
+        setLoading(Boolean(nextChatId)); setChats(items); setChatId(nextChatId); writeTaskViewState({ chatId: nextChatId });
+        if (!nextChatId) setLoading(false);
       })
-      .catch((reason) => handleFailure(reason, "暂时无法连接管理服务，请稍后刷新。"))
-      .finally(() => setLoading(false));
+      .catch((reason) => {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+          handleFailure(reason, "暂时无法连接管理服务，请稍后刷新。");
+        }
+      });
+    return () => controller.abort();
   }, [handleFailure]);
 
   useEffect(() => {
+    activeChatId.current = chatId;
     if (chatId) rememberChatId(chatId);
   }, [chatId]);
 
   useEffect(() => {
     if (!chatId) return;
+    const token = ++dashboardRequest.current;
+    const controller = new AbortController();
+    let pageRedirected = false;
     const params = buildTaskParams(filter, query, TASK_PAGE_SIZE, (page - 1) * TASK_PAGE_SIZE);
-    Promise.all([apiRequest<Dashboard>(`/api/chats/${chatId}/dashboard`), apiRequest<TaskPage>(`/api/chats/${chatId}/tasks?${params}`)])
-      .then(([summary, tasks]) => {
+    Promise.all([
+      apiRequest<Dashboard>(`/api/chats/${chatId}/dashboard`, { signal: controller.signal }),
+      apiRequest<TaskPage>(`/api/chats/${chatId}/tasks?${params}`, { signal: controller.signal }),
+      apiRequest<Chat[]>("/api/chats", { signal: controller.signal }),
+    ])
+      .then(([summary, tasks, chatItems]) => {
+        if (token !== dashboardRequest.current || activeChatId.current !== chatId) return;
         const resolvedPage = tasks.total_pages > 0 ? Math.min(page, tasks.total_pages) : 1;
-        if (resolvedPage !== page) { setPage(resolvedPage); writeTaskViewState({ page: resolvedPage }); }
-        setDashboard(summary); setTaskPage(tasks); setError("");
+        setDashboard(summary); setChats(chatItems); setError("");
+        if (resolvedPage !== page) {
+          pageRedirected = true;
+          setPage(resolvedPage);
+          writeTaskViewState({ page: resolvedPage });
+          return;
+        }
+        setTaskPage(tasks);
       })
-      .catch((reason) => handleFailure(reason, "群聊数据加载失败，请稍后刷新。"))
-      .finally(() => setLoading(false));
-  }, [chatId, filter, query, page, handleFailure]);
+      .catch((reason) => {
+        if (!controller.signal.aborted && token === dashboardRequest.current) handleFailure(reason, "群聊数据加载失败，请稍后刷新。");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted && token === dashboardRequest.current && !pageRedirected) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [chatId, filter, query, page, refreshVersion, handleFailure]);
 
-  const loadAdministration = useCallback(async () => {
-    if (!chatId) return;
+  const loadAdministration = useCallback(async (requestedChatId = chatId) => {
+    if (!requestedChatId) return;
+    const token = ++administrationRequest.current;
     setAdministrationLoading(true);
     try {
-      const memberItems = await apiRequest<Member[]>(`/api/chats/${chatId}/members`);
-      const eventItems = await apiRequest<AdministratorEvent[]>(`/api/chats/${chatId}/administrator-events?limit=100`);
+      const [memberItems, eventItems] = await Promise.all([
+        apiRequest<Member[]>(`/api/chats/${requestedChatId}/members`),
+        apiRequest<AdministratorEvent[]>(`/api/chats/${requestedChatId}/administrator-events?limit=100`),
+      ]);
+      if (token !== administrationRequest.current || activeChatId.current !== requestedChatId) return;
       setMembers(memberItems); setAdministratorEvents(eventItems); setError("");
-    } catch (reason) { handleFailure(reason, "管理员数据加载失败，请稍后刷新。"); }
-    finally { setAdministrationLoading(false); }
+    } catch (reason) {
+      if (token === administrationRequest.current && activeChatId.current === requestedChatId) handleFailure(reason, "管理员数据加载失败，请稍后刷新。");
+    }
+    finally { if (token === administrationRequest.current) setAdministrationLoading(false); }
   }, [chatId, handleFailure]);
 
-  const loadSettings = useCallback(async () => {
-    if (!chatId) return;
+  const loadSettings = useCallback(async (requestedChatId = chatId) => {
+    if (!requestedChatId) return;
+    const token = ++settingsRequest.current;
     setSettingsLoading(true);
     try {
       const [settings, events, memberItems] = await Promise.all([
-        apiRequest<ChatSettings>(`/api/chats/${chatId}/settings`),
-        apiRequest<ChatSettingEvent[]>(`/api/chats/${chatId}/settings/events?limit=20`),
-        apiRequest<Member[]>(`/api/chats/${chatId}/members`),
+        apiRequest<ChatSettings>(`/api/chats/${requestedChatId}/settings`),
+        apiRequest<ChatSettingEvent[]>(`/api/chats/${requestedChatId}/settings/events?limit=20`),
+        apiRequest<Member[]>(`/api/chats/${requestedChatId}/members`),
       ]);
+      if (token !== settingsRequest.current || activeChatId.current !== requestedChatId) return;
       setChatSettings(settings); setChatSettingEvents(events); setMembers(memberItems); setError("");
-    } catch (reason) { handleFailure(reason, "群设置加载失败，请稍后刷新。"); }
-    finally { setSettingsLoading(false); }
+    } catch (reason) {
+      if (token === settingsRequest.current && activeChatId.current === requestedChatId) handleFailure(reason, "群设置加载失败，请稍后刷新。");
+    }
+    finally { if (token === settingsRequest.current) setSettingsLoading(false); }
   }, [chatId, handleFailure]);
 
   useEffect(() => {
@@ -161,46 +210,66 @@ export function DashboardClient() {
   const administratorCount = members.filter((member) => member.is_administrator).length;
 
   async function openTask(task: Task) {
+    const requestedChatId = task.chat_id;
+    const token = ++taskDetailRequest.current;
+    taskMutationRequest.current += 1;
+    taskDetailAbort.current?.abort();
+    const controller = new AbortController();
+    taskDetailAbort.current = controller;
     try {
-      const [taskDetail, memberItems] = await Promise.all([
-        apiRequest<TaskDetail>(`/api/chats/${task.chat_id}/tasks/${task.task_id}`),
-        apiRequest<Member[]>(`/api/chats/${task.chat_id}/members`),
+      const [taskDetail, memberItems, candidates] = await Promise.all([
+        apiRequest<TaskDetail>(`/api/chats/${requestedChatId}/tasks/${task.task_id}`, { signal: controller.signal }),
+        apiRequest<Member[]>(`/api/chats/${requestedChatId}/members`, { signal: controller.signal }),
+        loadAllMergeTargets(requestedChatId, controller.signal),
       ]);
-      setDetail(taskDetail); setMembers(memberItems);
+      if (token !== taskDetailRequest.current || activeChatId.current !== requestedChatId) return;
+      setDetail(taskDetail); setMembers(memberItems); setMergeTargets(candidates); setError("");
     }
-    catch (reason) { handleFailure(reason, "任务详情加载失败。"); }
+    catch (reason) {
+      if (!controller.signal.aborted && token === taskDetailRequest.current && activeChatId.current === requestedChatId) handleFailure(reason, "任务详情加载失败。");
+    }
+    finally { if (taskDetailAbort.current === controller) taskDetailAbort.current = null; }
   }
 
   async function openTaskCreation() {
-    if (!chatId) return;
+    const requestedChatId = chatId;
+    if (!requestedChatId) return;
+    const token = ++taskCreationRequest.current;
     setCreating(true);
     try {
-      const memberItems = await apiRequest<Member[]>(`/api/chats/${chatId}/members`);
+      const memberItems = await apiRequest<Member[]>(`/api/chats/${requestedChatId}/members`);
+      if (token !== taskCreationRequest.current || activeChatId.current !== requestedChatId) return;
       setMembers(memberItems); setError("");
     } catch (reason) {
+      if (token !== taskCreationRequest.current || activeChatId.current !== requestedChatId) return;
       setCreating(false); handleFailure(reason, "当前群成员加载失败，暂时无法新建任务。");
     }
   }
 
-  async function refreshChatSummary() {
-    const [items, summary] = await Promise.all([apiRequest<Chat[]>("/api/chats"), apiRequest<Dashboard>(`/api/chats/${chatId}/dashboard`)]);
-    setChats(items); setDashboard(summary);
+  async function refreshChatSummary(requestedChatId: string) {
+    if (!requestedChatId) return;
+    const token = ++summaryRequest.current;
+    const [items, summary] = await Promise.all([apiRequest<Chat[]>("/api/chats"), apiRequest<Dashboard>(`/api/chats/${requestedChatId}/dashboard`)]);
+    if (token !== summaryRequest.current) return;
+    setChats(items);
+    if (activeChatId.current === requestedChatId) setDashboard(summary);
   }
 
   async function mutateTask(resource: "deadline" | "title" | "assignees" | "status", body: Record<string, string | string[] | number>) {
     if (!detail) return;
-    const updated = await apiRequest<TaskDetail>(`/api/chats/${detail.task.chat_id}/tasks/${detail.task.task_id}/${resource}`, {
+    const taskChatId = detail.task.chat_id;
+    const taskId = detail.task.task_id;
+    const token = ++taskMutationRequest.current;
+    const updated = await apiRequest<TaskDetail>(`/api/chats/${taskChatId}/tasks/${taskId}/${resource}`, {
       method: "POST",
       body: JSON.stringify(body),
     });
-    setDetail(updated);
-    const params = buildTaskParams(filter, query, TASK_PAGE_SIZE, (page - 1) * TASK_PAGE_SIZE);
-    const [summary, tasks, chatItems] = await Promise.all([
-      apiRequest<Dashboard>(`/api/chats/${chatId}/dashboard`),
-      apiRequest<TaskPage>(`/api/chats/${chatId}/tasks?${params}`),
-      apiRequest<Chat[]>("/api/chats"),
-    ]);
-    setDashboard(summary); setTaskPage(tasks); setChats(chatItems);
+    if (activeChatId.current !== taskChatId) return;
+    if (token === taskMutationRequest.current) {
+      setDetail((current) => current?.task.task_id === taskId && current.task.chat_id === taskChatId ? updated : current);
+    }
+    setLoading(true);
+    setRefreshVersion((version) => version + 1);
   }
 
   async function rescheduleTask(deadline: string, requestId: string) {
@@ -251,34 +320,43 @@ export function DashboardClient() {
   }
 
   async function createTask(input: ManualTaskInput) {
-    const created = await apiRequest<TaskDetail>(`/api/chats/${chatId}/tasks`, {
+    const requestedChatId = chatId;
+    if (!requestedChatId) return;
+    const token = ++taskCreationRequest.current;
+    const created = await apiRequest<TaskDetail>(`/api/chats/${requestedChatId}/tasks`, {
       method: "POST",
       body: JSON.stringify(input),
     });
+    if (token !== taskCreationRequest.current || activeChatId.current !== requestedChatId) return;
     setCreating(false); setDetail(created);
-    const params = buildTaskParams(filter, query, TASK_PAGE_SIZE, (page - 1) * TASK_PAGE_SIZE);
-    const [summary, tasks, chatItems] = await Promise.all([
-      apiRequest<Dashboard>(`/api/chats/${chatId}/dashboard`),
-      apiRequest<TaskPage>(`/api/chats/${chatId}/tasks?${params}`),
-      apiRequest<Chat[]>("/api/chats"),
-    ]);
-    setDashboard(summary); setTaskPage(tasks); setChats(chatItems);
+    setLoading(true);
+    setRefreshVersion((version) => version + 1);
+    try {
+      const candidates = await loadAllMergeTargets(requestedChatId);
+      if (token === taskCreationRequest.current && activeChatId.current === requestedChatId) setMergeTargets(candidates);
+    }
+    catch {
+      if (token === taskCreationRequest.current && activeChatId.current === requestedChatId) setMergeTargets([]);
+    }
   }
 
   async function changeAdministrator(member: Member) {
+    const requestedChatId = chatId;
+    if (!requestedChatId) return;
     if (member.is_administrator && administratorCount <= 1) { setAdministrationNotice("每个群必须保留至少一名管理员。"); return; }
     if (member.is_administrator && !window.confirm(`确认撤销“${member.name}”的本群管理员权限？`)) return;
     setMutatingOpenId(member.open_id); setAdministrationNotice("");
     try {
       if (member.is_administrator) {
-        await apiRequest(`/api/chats/${chatId}/administrators/${member.open_id}`, { method: "DELETE" });
-        setAdministrationNotice(`已撤销“${member.name}”的管理员权限。`);
+        await apiRequest(`/api/chats/${requestedChatId}/administrators/${member.open_id}`, { method: "DELETE" });
+        if (activeChatId.current === requestedChatId) setAdministrationNotice(`已撤销“${member.name}”的管理员权限。`);
       } else {
-        await apiRequest(`/api/chats/${chatId}/administrators`, { method: "POST", body: JSON.stringify({ open_id: member.open_id }) });
-        setAdministrationNotice(`已将“${member.name}”设为本群管理员。`);
+        await apiRequest(`/api/chats/${requestedChatId}/administrators`, { method: "POST", body: JSON.stringify({ open_id: member.open_id }) });
+        if (activeChatId.current === requestedChatId) setAdministrationNotice(`已将“${member.name}”设为本群管理员。`);
       }
-      await Promise.all([loadAdministration(), refreshChatSummary()]);
+      await Promise.all([loadAdministration(requestedChatId), refreshChatSummary(requestedChatId)]);
     } catch (reason) {
+      if (activeChatId.current !== requestedChatId) return;
       if (reason instanceof UnauthorizedError) setUnauthorized(true);
       else if (reason instanceof ApiError && reason.message.includes("last administrator")) setAdministrationNotice("操作被拒绝：每个群必须保留至少一名管理员。");
       else if (reason instanceof ApiError && reason.status === 503) setAdministrationNotice("暂时无法向飞书核验最新成员，请稍后重试。");
@@ -287,19 +365,44 @@ export function DashboardClient() {
   }
 
   async function saveSettings(next: Partial<ChatSettingValues>) {
-    if (!chatId) return;
+    const requestedChatId = chatId;
+    if (!requestedChatId) return;
+    const token = ++settingsRequest.current;
     setSettingsSaving(true); setSettingsNotice("");
     try {
-      const updated = await apiRequest<ChatSettings>(`/api/chats/${chatId}/settings`, {
+      const updated = await apiRequest<ChatSettings>(`/api/chats/${requestedChatId}/settings`, {
         method: "POST", body: JSON.stringify(next),
       });
+      if (token !== settingsRequest.current || activeChatId.current !== requestedChatId) return;
       setChatSettings(updated);
-      const events = await apiRequest<ChatSettingEvent[]>(`/api/chats/${chatId}/settings/events?limit=20`);
+      const events = await apiRequest<ChatSettingEvent[]>(`/api/chats/${requestedChatId}/settings/events?limit=20`);
+      if (token !== settingsRequest.current || activeChatId.current !== requestedChatId) return;
       setChatSettingEvents(events); setSettingsNotice("群设置已保存。"); setError("");
     } catch (reason) {
+      if (token !== settingsRequest.current || activeChatId.current !== requestedChatId) return;
       if (reason instanceof UnauthorizedError) setUnauthorized(true);
       else setSettingsNotice("群设置保存失败，请稍后重试。");
-    } finally { setSettingsSaving(false); }
+    } finally { if (token === settingsRequest.current) setSettingsSaving(false); }
+  }
+
+  function changeChat(nextChatId: string) {
+    activeChatId.current = nextChatId;
+    dashboardRequest.current += 1;
+    administrationRequest.current += 1;
+    settingsRequest.current += 1;
+    taskDetailRequest.current += 1;
+    taskDetailAbort.current?.abort();
+    taskDetailAbort.current = null;
+    taskCreationRequest.current += 1;
+    taskMutationRequest.current += 1;
+    summaryRequest.current += 1;
+    setLoading(true); setChatId(nextChatId); setPage(1);
+    setDashboard(null); setTaskPage(null); setMembers([]);
+    setAdministratorEvents([]); setChatSettings(null); setChatSettingEvents([]);
+    setDetail(null); setMergeTargets([]); setCreating(false);
+    setAdministrationLoading(view === "administrators"); setSettingsLoading(view === "settings"); setSettingsSaving(false); setMutatingOpenId("");
+    setAdministrationNotice(""); setSettingsNotice(""); setError("");
+    writeTaskViewState({ chatId: nextChatId, page: 1 });
   }
 
   async function logout() { try { await apiRequest<null>("/auth/logout", { method: "POST" }); } finally { setUnauthorized(true); } }
@@ -316,11 +419,11 @@ export function DashboardClient() {
       <button className="avatar avatar-button" type="button" onClick={logout} title="退出登录">管</button>
     </aside>
     <section className="workspace">
-      <header className="topbar"><div><p className="eyebrow">LAB TASK CONSOLE</p><h1>{view === "tasks" ? "任务总览" : view === "administrators" ? "群管理员" : "群设置"}</h1></div><div className="topbar-actions"><span className="live-pill"><i /> 权限连接正常</span><label className="group-switcher"><span className="sr-only">选择群聊</span><select value={chatId} onChange={(event) => { const nextChatId = event.target.value; setLoading(true); setChatId(nextChatId); setPage(1); setAdministrationNotice(""); setSettingsNotice(""); writeTaskViewState({ chatId: nextChatId, page: 1 }); }}>{chats.map((chat) => <option key={chat.chat_id} value={chat.chat_id}>{chat.chat_name ?? "未命名群聊"}</option>)}</select><b>⌄</b></label></div></header>
+      <header className="topbar"><div><p className="eyebrow">LAB TASK CONSOLE</p><h1>{view === "tasks" ? "任务总览" : view === "administrators" ? "群管理员" : "群设置"}</h1></div><div className="topbar-actions"><span className="live-pill"><i /> 权限连接正常</span><label className="group-switcher"><span className="sr-only">选择群聊</span><select value={chatId} onChange={(event) => changeChat(event.target.value)}>{chats.map((chat) => <option key={chat.chat_id} value={chat.chat_id}>{chat.chat_name ?? "未命名群聊"}</option>)}</select><b>⌄</b></label></div></header>
       {view === "tasks" ? <TaskWorkspace dashboard={dashboard} error={error} filter={filter} loading={loading} page={page} query={query} searchInput={searchInput} selectedChat={selectedChat} setFilter={changeFilter} setSearchInput={setSearchInput} onSearch={applySearch} onClearSearch={clearSearch} onPageChange={changePage} taskPage={taskPage} openTask={openTask} openTaskCreation={openTaskCreation} /> : view === "administrators" ? <AdministratorWorkspace chatName={selectedChat?.chat_name ?? "当前群聊"} error={error} loading={administrationLoading} members={members} events={administratorEvents} mutatingOpenId={mutatingOpenId} notice={administrationNotice} onChange={changeAdministrator} /> : <SettingsWorkspace chatName={selectedChat?.chat_name ?? "当前群聊"} error={error} loading={settingsLoading} saving={settingsSaving} settings={chatSettings} members={members} events={chatSettingEvents} notice={settingsNotice} onSave={saveSettings} />}
     </section>
     {creating ? <CreateTaskDialog chatName={selectedChat?.chat_name ?? "当前群聊"} members={members} onClose={() => setCreating(false)} onSave={createTask} /> : null}
-    {detail ? <TaskDrawer detail={detail} mergeTargets={taskPage?.tasks ?? []} members={members} onClose={() => setDetail(null)} onRename={renameTask} onReassign={reassignTask} onReschedule={rescheduleTask} onTransition={transitionTask} /> : null}
+    {detail ? <TaskDrawer key={`${detail.task.chat_id}-${detail.task.task_id}`} detail={detail} mergeTargets={mergeTargets} members={members} onClose={() => { taskDetailRequest.current += 1; taskDetailAbort.current?.abort(); taskDetailAbort.current = null; setDetail(null); setMergeTargets([]); }} onRename={renameTask} onReassign={reassignTask} onReschedule={rescheduleTask} onTransition={transitionTask} /> : null}
   </main>;
 }
 
@@ -373,7 +476,7 @@ function SettingsWorkspace(props: SettingsWorkspaceProps) {
   return <><BaseSettingsWorkspace {...props} /><section className="notification-policy-workspace" aria-labelledby="administrator-notification-heading"><div className="panel-heading"><div><h2 id="administrator-notification-heading">管理员通知对象</h2><p>任务完成、取消、延期、逾期和缺少截止时间时，按此范围发送私聊。</p></div><span className="secure-badge">按群隔离</span></div>{props.loading || !settings ? <div className="table-message">正在读取管理员通知设置…</div> : <form className="notification-policy-form" onSubmit={submit}><div className="notification-mode-grid"><label className={mode === "all" ? "notification-mode selected" : "notification-mode"}><input type="radio" name="administrator-notification-mode" value="all" checked={mode === "all"} disabled={saving} onChange={() => { setMode("all"); setSelected([]); }} /><span><b>全部管理员</b><small>默认策略；向当前群全部管理员发送</small></span></label><label className={mode === "selected" ? "notification-mode selected" : "notification-mode"}><input type="radio" name="administrator-notification-mode" value="selected" checked={mode === "selected"} disabled={saving} onChange={() => setMode("selected")} /><span><b>指定管理员</b><small>可以选择一名或多名本群管理员</small></span></label></div>{mode === "selected" ? <fieldset className="notification-recipient-fieldset"><legend>选择接收人</legend>{administrators.map((member) => <label key={member.open_id}><input type="checkbox" checked={selected.includes(member.open_id)} disabled={saving} onChange={(event) => toggle(member.open_id, event.target.checked)} /><span><b>{member.name}</b><small>{member.is_owner ? "群主 · 管理员" : "本群管理员"}</small></span></label>)}</fieldset> : null}{!valid ? <p className="settings-validation" role="alert">请至少选择一名当前群管理员。</p> : null}<button className="save-settings-button" type="submit" disabled={saving || !changed || !valid}>{saving ? "保存中…" : "保存通知对象"}</button></form>}</section></>;
 }
 
-function BaseSettingsWorkspace({ chatName, error, loading, saving, settings, members, events, notice, onSave }: SettingsWorkspaceProps) {
+function BaseSettingsWorkspace({ chatName, error, loading, saving, settings, events, notice, onSave }: SettingsWorkspaceProps) {
   const [enabled, setEnabled] = useState(true);
   const [confidence, setConfidence] = useState(0.85);
   const [taskScope, setTaskScope] = useState<"broad" | "work_only">("broad");
@@ -389,8 +492,6 @@ function BaseSettingsWorkspace({ chatName, error, loading, saving, settings, mem
   const [missingAdminEnabled, setMissingAdminEnabled] = useState(true);
   const [missingOwnerHours, setMissingOwnerHours] = useState(24);
   const [missingAdminHours, setMissingAdminHours] = useState(72);
-  const [administratorNotificationMode, setAdministratorNotificationMode] = useState<"all" | "selected">("all");
-  const [administratorNotificationOpenIds, setAdministratorNotificationOpenIds] = useState<string[]>([]);
   useEffect(() => {
     if (!settings) return;
     const timer = window.setTimeout(() => {
@@ -409,14 +510,9 @@ function BaseSettingsWorkspace({ chatName, error, loading, saving, settings, mem
       setMissingAdminEnabled(settings.missing_deadline_admin_enabled);
       setMissingOwnerHours(settings.missing_deadline_owner_delay_hours);
       setMissingAdminHours(settings.missing_deadline_admin_delay_hours);
-      setAdministratorNotificationMode(settings.administrator_notification_mode);
-      setAdministratorNotificationOpenIds(settings.administrator_notification_open_ids);
     }, 0);
     return () => window.clearTimeout(timer);
   }, [settings]);
-  const administrators = members.filter((member) => member.is_administrator);
-  const normalizedAdministratorNotificationOpenIds = [...administratorNotificationOpenIds].sort();
-  const savedAdministratorNotificationOpenIds = [...(settings?.administrator_notification_open_ids ?? [])].sort();
   const changed = settings !== null && (
     enabled !== settings.detection_enabled
     || Math.abs(confidence - settings.auto_todo_confidence) > 0.0001
@@ -433,18 +529,11 @@ function BaseSettingsWorkspace({ chatName, error, loading, saving, settings, mem
     || missingAdminEnabled !== settings.missing_deadline_admin_enabled
     || missingOwnerHours !== settings.missing_deadline_owner_delay_hours
     || missingAdminHours !== settings.missing_deadline_admin_delay_hours
-    || administratorNotificationMode !== settings.administrator_notification_mode
-    || normalizedAdministratorNotificationOpenIds.join("\u0000") !== savedAdministratorNotificationOpenIds.join("\u0000")
   );
   const timingValid = due72Offset > due24Offset;
   const missingDeadlineValid = missingAdminHours > missingOwnerHours;
-  const administratorNotificationValid = administratorNotificationMode === "all" || (
-    administratorNotificationOpenIds.length > 0
-    && administratorNotificationOpenIds.every((openId) => administrators.some((member) => member.open_id === openId))
-  );
   function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!administratorNotificationValid) return;
     void onSave({
       detection_enabled: enabled,
       auto_todo_confidence: confidence,
@@ -461,8 +550,6 @@ function BaseSettingsWorkspace({ chatName, error, loading, saving, settings, mem
       missing_deadline_admin_enabled: missingAdminEnabled,
       missing_deadline_owner_delay_hours: missingOwnerHours,
       missing_deadline_admin_delay_hours: missingAdminHours,
-      administrator_notification_mode: administratorNotificationMode,
-      administrator_notification_open_ids: administratorNotificationMode === "all" ? [] : normalizedAdministratorNotificationOpenIds,
     });
   }
   // Both radio labels on the compact JSX line wrap their input and visible
@@ -542,6 +629,14 @@ function TaskDrawer({ detail, mergeTargets, members, onClose, onRename, onReassi
   const actionable = detail.task.status === "todo" || detail.task.status === "overdue";
   const unchanged = deadlineValue === formatShanghaiInput(detail.task.deadline);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDeadlineValue(formatShanghaiInput(detail.task.deadline));
+      pendingRequestId.current = "";
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [detail.task.deadline, detail.task.updated_at]);
+
   async function submitDeadline(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!deadlineValue || !actionable || unchanged) return;
@@ -600,7 +695,8 @@ function MergeEditor({ task, targets, onSave }: { task: Task; targets: Task[]; o
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const requestId = useRef("");
-  if (!sourceMergeable || !options.length) return null;
+  if (!sourceMergeable) return null;
+  if (!options.length) return <section className="merge-editor merge-editor-empty" aria-label="合并重复任务"><div className="editor-heading"><div><span>合并重复任务</span><small>已检查本群全部可合并任务</small></div></div><p className="empty-copy">当前没有其他可作为保留目标的任务。</p></section>;
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -630,6 +726,14 @@ function TitleEditor({ task, onSave }: { task: Task; onSave: (title: string, req
   const requestId = useRef("");
   const normalized = value.trim().replace(/\s+/g, " ");
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setValue(task.title);
+      requestId.current = "";
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [task.task_id, task.title, task.updated_at]);
+
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!normalized || normalized === task.title || normalized.length > 200) return;
@@ -653,6 +757,14 @@ function AssigneeEditor({ members, task, onSave }: { members: Member[]; task: Ta
   const requestId = useRef("");
   const current = task.assignees.map((item) => item.open_id);
   const unchanged = sameOrder(selected, current);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setSelected(task.assignees.map((item) => item.open_id));
+      requestId.current = "";
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [task.assignees, task.task_id, task.updated_at]);
 
   function toggle(openId: string, checked: boolean) {
     setSelected((items) => checked ? [...items, openId] : items.filter((item) => item !== openId));
@@ -689,6 +801,23 @@ function buildTaskParams(filter: string, query: string, limit = TASK_PAGE_SIZE, 
   else if (filter !== "all") params.append("status", filter);
   if (query.trim()) params.set("query", query.trim());
   return params;
+}
+function buildMergeTargetParams() {
+  const params = new URLSearchParams({ limit: "100", offset: "0" });
+  ["pending", "todo", "overdue", "done"].forEach((status) => params.append("status", status));
+  return params;
+}
+async function loadAllMergeTargets(chatId: string, signal?: AbortSignal) {
+  const tasks: Task[] = [];
+  let offset = 0;
+  while (true) {
+    const params = buildMergeTargetParams();
+    params.set("offset", String(offset));
+    const page = await apiRequest<TaskPage>(`/api/chats/${chatId}/tasks?${params}`, { signal });
+    tasks.push(...page.tasks);
+    offset += page.tasks.length;
+    if (page.tasks.length === 0 || offset >= page.total_count) return tasks;
+  }
 }
 function readTaskViewState() {
   if (typeof window === "undefined") return { chatId: "", filter: "open", query: "", page: 1 };
@@ -735,7 +864,8 @@ function formatDeadline(value: string | null) { return value ? formatTime(value)
 function formatTime(value: string) { return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value)); }
 function formatShanghaiInput(value: string | null) {
   if (!value) return "";
-  const parts = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date(value));
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(value));
   const item = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
-  return `${item("year")}-${item("month")}-${item("day")}T${item("hour")}:${item("minute")}`;
+  const hour = item("hour") === "24" ? "00" : item("hour");
+  return `${item("year")}-${item("month")}-${item("day")}T${hour}:${item("minute")}`;
 }

@@ -83,6 +83,46 @@ class TaskNotificationWorkerTest(unittest.TestCase):
         self.repository.fail.assert_called_once()
         self.repository.mark_sent.assert_not_called()
 
+    def test_delivery_audit_failure_is_retried_without_crashing_worker(self) -> None:
+        self.repository.claim_due.return_value = self.lease
+        self.sender.deliver.return_value = TaskNotificationDeliveryReceipt(
+            message_id="om_sent",
+            receive_id_type="chat_id",
+            receive_id="oc_admin_dm",
+        )
+        self.repository.mark_sent.side_effect = RuntimeError("database locked")
+        self.repository.fail.return_value = Mock(
+            status=TaskNotificationStatus.SCHEDULED,
+            retry_at=self.now + timedelta(seconds=30),
+        )
+
+        outcome = self._worker().run_once("worker")
+
+        self.assertEqual(
+            outcome.status,
+            TaskNotificationWorkerStatus.RETRY_SCHEDULED,
+        )
+        self.assertEqual(outcome.error_code, "delivery_audit_error")
+        self.repository.fail.assert_called_once()
+
+    def test_keyboard_interrupt_is_recorded_then_propagated(self) -> None:
+        self.repository.claim_due.return_value = self.lease
+        self.sender.deliver.side_effect = KeyboardInterrupt()
+        self.repository.fail.return_value = Mock(
+            status=TaskNotificationStatus.SCHEDULED,
+            retry_at=self.now + timedelta(seconds=30),
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._worker().run_once("worker")
+
+        self.repository.fail.assert_called_once()
+        self.assertEqual(
+            self.repository.fail.call_args.kwargs["error_code"],
+            "worker_interrupted",
+        )
+        self.repository.mark_sent.assert_not_called()
+
     def test_idle_does_not_call_sender(self) -> None:
         self.repository.claim_due.return_value = None
 

@@ -21,6 +21,7 @@ from app.database.models import (
     Task,
     TaskLifecycleEvent,
     TaskNotification,
+    TaskNotificationDeferredLifecycleEvent,
     TaskNotificationState,
     User,
 )
@@ -486,34 +487,59 @@ def _sync_all_in_session(
         )
         session.add(state)
         session.flush()
-    events = tuple(
+    tracked_actions = (
+        "complete",
+        "cancel",
+        "reschedule",
+        "rename",
+        "reassign",
+        "invalidate",
+        "restore",
+        "merge",
+    )
+    new_events = tuple(
         session.scalars(
             select(TaskLifecycleEvent)
             .where(
                 TaskLifecycleEvent.id > state.last_lifecycle_event_id,
-                TaskLifecycleEvent.action.in_(
-                    (
-                        "complete",
-                        "cancel",
-                        "reschedule",
-                        "rename",
-                        "reassign",
-                        "invalidate",
-                        "restore",
-                        "merge",
-                    )
-                ),
+                TaskLifecycleEvent.action.in_(tracked_actions),
             )
             .order_by(TaskLifecycleEvent.id)
         )
     )
+    deferred_rows = tuple(
+        session.scalars(
+            select(TaskNotificationDeferredLifecycleEvent).order_by(
+                TaskNotificationDeferredLifecycleEvent.event_id
+            )
+        )
+    )
+    deferred_by_id = {item.event_id: item for item in deferred_rows}
+    events_by_id = {event.id: event for event in new_events}
+    for deferred in deferred_rows:
+        event = session.get(TaskLifecycleEvent, deferred.event_id)
+        if event is not None and event.action in tracked_actions:
+            events_by_id[event.id] = event
+        elif event is None:
+            session.delete(deferred)
+    events = tuple(events_by_id[event_id] for event_id in sorted(events_by_id))
     for event in events:
         task = tasks_by_id.get(event.task_id)
         if task is None:
+            if event.id not in deferred_by_id:
+                deferred = TaskNotificationDeferredLifecycleEvent(
+                    event_id=event.id,
+                    deferred_at=synced_at,
+                )
+                session.add(deferred)
+                deferred_by_id[event.id] = deferred
             continue
         if event.action == "merge":
             # Merging cancels the duplicate task's unsent deliveries in the
             # lifecycle transaction; it does not create another status notice.
+            deferred = deferred_by_id.pop(event.id, None)
+            if deferred is not None:
+                session.delete(deferred)
             continue
         task_administrator_open_ids = _notification_administrator_open_ids(
             session, task.chat_id, administrator_open_ids
@@ -612,6 +638,9 @@ def _sync_all_in_session(
                 source_lifecycle_event_id=event.id,
                 owner_name_snapshot=responsible_names,
             )
+        deferred = deferred_by_id.pop(event.id, None)
+        if deferred is not None:
+            session.delete(deferred)
     newest_event_id = session.scalar(
         select(TaskLifecycleEvent.id)
         .where(TaskLifecycleEvent.id > state.last_lifecycle_event_id)
@@ -1060,6 +1089,9 @@ def _require_owned_lease(
     *,
     active_at: datetime,
 ) -> TaskNotification:
+    # Expiry only makes a lease eligible for recovery by another claimant; it
+    # does not revoke ownership on its own. worker_id plus the monotonically
+    # increasing attempt number rejects an old worker after actual recovery.
     _aware_utc(active_at, "active_at")
     notification = session.get(TaskNotification, lease.notification_id)
     if (

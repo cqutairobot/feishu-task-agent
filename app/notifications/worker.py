@@ -95,6 +95,13 @@ class TaskNotificationWorker:
             )
         try:
             receipt = self._sender.deliver(lease)
+        except KeyboardInterrupt as exc:
+            self._record_failure(
+                lease,
+                error_code="worker_interrupted",
+                error=exc,
+            )
+            raise
         except TaskNotificationDeliveryError as exc:
             return self._record_failure(
                 lease, error_code=exc.code, error=exc
@@ -103,13 +110,20 @@ class TaskNotificationWorker:
             return self._record_failure(
                 lease, error_code="delivery_error", error=exc
             )
-        self._repository.mark_sent(
-            lease,
-            feishu_message_id=receipt.message_id,
-            receive_id_type=receipt.receive_id_type,
-            receive_id=receipt.receive_id,
-            sent_at=self._clock(),
-        )
+        try:
+            self._repository.mark_sent(
+                lease,
+                feishu_message_id=receipt.message_id,
+                receive_id_type=receipt.receive_id_type,
+                receive_id=receipt.receive_id,
+                sent_at=self._clock(),
+            )
+        except Exception as exc:
+            return self._record_failure(
+                lease,
+                error_code="delivery_audit_error",
+                error=exc,
+            )
         return TaskNotificationWorkerOutcome(
             status=TaskNotificationWorkerStatus.SENT,
             notification_id=lease.notification_id,

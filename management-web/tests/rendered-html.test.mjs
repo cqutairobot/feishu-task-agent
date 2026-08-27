@@ -93,7 +93,7 @@ test("browser API requests rely on the HttpOnly session cookie", async () => {
   assert.match(source, /\/api\/chats/);
   assert.match(source, /飞书名称：/);
   assert.match(source, /resource: "deadline" \| "title" \| "assignees" \| "status"/);
-  assert.match(source, /\/tasks\/\$\{detail\.task\.task_id\}\/\$\{resource\}/);
+  assert.match(source, /\/tasks\/\$\{taskId\}\/\$\{resource\}/);
   assert.match(source, /mutateTask\("deadline"/);
   assert.match(source, /mutateTask\("title"/);
   assert.match(source, /mutateTask\("assignees"/);
@@ -177,5 +177,34 @@ test("browser API requests rely on the HttpOnly session cookie", async () => {
   assert.match(source, /第一位为主负责人/);
   assert.match(source, /北京时间（UTC\+8）/);
   assert.match(source, /window\.crypto\.randomUUID\(\)/);
+  assert.match(source, /const dashboardRequest = useRef\(0\)/);
+  assert.match(source, /const taskDetailAbort = useRef<AbortController \| null>\(null\)/);
+  assert.match(source, /token !== dashboardRequest\.current/);
+  assert.match(source, /activeChatId\.current !== requestedChatId/);
+  assert.match(source, /function changeChat[\s\S]{0,900}setDetail\(null\)/);
+  assert.match(source, /setRefreshVersion\(\(version\) => version \+ 1\)/);
+  assert.match(source, /loadAllMergeTargets/);
+  assert.match(source, /offset >= page\.total_count/);
+  assert.match(source, /setValue\(task\.title\)/);
+  assert.match(source, /setSelected\(task\.assignees\.map/);
+  assert.match(source, /hourCycle: "h23"/);
+  assert.match(source, /item\("hour"\) === "24" \? "00"/);
   assert.doesNotMatch(source, /actor_open_id=|请输入.*Open ID/i);
+});
+
+test("base group settings cannot overwrite administrator notification recipients", async () => {
+  const source = await readFile(
+    new URL("../app/dashboard-client.tsx", import.meta.url),
+    "utf8",
+  );
+  const start = source.indexOf("function BaseSettingsWorkspace");
+  const end = source.indexOf("\nfunction ReminderStage", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const baseSettingsSource = source.slice(start, end);
+
+  assert.doesNotMatch(baseSettingsSource, /administratorNotificationMode/);
+  assert.doesNotMatch(baseSettingsSource, /administratorNotificationOpenIds/);
+  assert.doesNotMatch(baseSettingsSource, /administrator_notification_mode/);
+  assert.doesNotMatch(baseSettingsSource, /administrator_notification_open_ids/);
 });

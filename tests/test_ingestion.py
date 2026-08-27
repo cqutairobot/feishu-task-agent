@@ -25,7 +25,11 @@ from app.database.models import (
     Message,
     User,
 )
-from app.database.repository import MessageRepository, SaveStatus
+from app.database.repository import (
+    MessageRepository,
+    SaveStatus,
+    TenantIsolationError,
+)
 from app.ingestion.service import MessageIngestionService
 from tests.test_messages import TEXT_EVENT
 
@@ -89,6 +93,54 @@ class MessageIngestionTest(unittest.TestCase):
 
         self.assertEqual(duplicate.persistence.status, SaveStatus.DUPLICATE)
         self.assertEqual(self.repository.count(), 1)
+
+    def test_second_event_tenant_is_rejected_without_mutating_identity(self) -> None:
+        self.service.process_payload(TEXT_EVENT, received_at=self.received_at)
+        other = deepcopy(TEXT_EVENT)
+        other["header"]["event_id"] = "evt_other_tenant"
+        other["header"]["tenant_key"] = "tenant_other"
+        other["event"]["sender"]["tenant_key"] = "tenant_other"
+        other["event"]["sender"]["sender_id"]["open_id"] = "ou_other"
+        other["event"]["message"]["message_id"] = "om_other_tenant"
+        other["event"]["message"]["chat_id"] = "oc_other_tenant"
+
+        with self.assertRaisesRegex(TenantIsolationError, "another Feishu tenant"):
+            self.service.process_payload(other, received_at=self.received_at)
+
+        with self.session_factory() as session:
+            self.assertEqual(session.scalar(select(func.count(Chat.chat_id))), 1)
+            self.assertEqual(session.scalar(select(func.count(User.open_id))), 1)
+            self.assertEqual(session.scalar(select(func.count(Message.id))), 1)
+            original = session.get(User, "ou_test")
+            assert original is not None
+            self.assertEqual(original.tenant_key, "tenant_test")
+
+    def test_second_directory_tenant_is_rejected(self) -> None:
+        self.repository.apply_directory_snapshot(
+            "oc_first",
+            "第一租户群",
+            {"ou_owner": "导师"},
+            owner_open_id="ou_owner",
+            authoritative_members=True,
+            chat_type="group",
+            tenant_key="tenant_test",
+            updated_at=self.received_at,
+        )
+
+        with self.assertRaisesRegex(TenantIsolationError, "another Feishu tenant"):
+            self.repository.apply_directory_snapshot(
+                "oc_second",
+                "第二租户群",
+                {"ou_other": "其他导师"},
+                owner_open_id="ou_other",
+                authoritative_members=True,
+                chat_type="group",
+                tenant_key="tenant_other",
+                updated_at=self.received_at,
+            )
+
+        with self.session_factory() as session:
+            self.assertIsNone(session.get(Chat, "oc_second"))
 
     def test_data_survives_engine_restart(self) -> None:
         self.service.process_payload(TEXT_EVENT, received_at=self.received_at)

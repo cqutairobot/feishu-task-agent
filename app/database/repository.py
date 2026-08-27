@@ -112,6 +112,10 @@ class MessageLookupError(LookupError):
     """Raised when an anchored conversation cannot resolve its trigger."""
 
 
+class TenantIsolationError(RuntimeError):
+    """Raised when a second Feishu tenant targets a single-tenant database."""
+
+
 class MessageRepository:
     """Persist a message and its chat/user references in one transaction."""
 
@@ -128,6 +132,7 @@ class MessageRepository:
         if not 0 <= debounce_seconds <= 60:
             raise ValueError("debounce_seconds must be between 0 and 60")
         with session_scope(self._session_factory) as session:
+            _require_database_tenant(session, incoming.tenant_key)
             self._upsert_chat(session, incoming)
             self._upsert_user(session, incoming)
             result = session.execute(
@@ -250,6 +255,7 @@ class MessageRepository:
                     raise ValueError(
                         "tenant_key and chat_type are required for a new chat"
                     )
+                _require_database_tenant(session, tenant_key)
                 chat = Chat(
                     chat_id=chat_id,
                     tenant_key=tenant_key,
@@ -262,6 +268,10 @@ class MessageRepository:
                 session.add(chat)
                 session.flush()
             else:
+                if tenant_key is not None and tenant_key != chat.tenant_key:
+                    raise TenantIsolationError(
+                        "directory snapshot tenant does not match its chat"
+                    )
                 chat.name = chat_name
                 chat.updated_at = updated_at
             if (
@@ -643,6 +653,24 @@ class MessageRepository:
             job_id=job.id,
             trigger_message_id=job.trigger_message_id,
             available_at=job.available_at,
+        )
+
+
+def _require_database_tenant(session: Session, tenant_key: str) -> None:
+    """Enforce the product's one-Feishu-tenant-per-database boundary.
+
+    Member tenant keys are intentionally not considered here: a group can
+    legitimately include external contacts. The chat tenant identifies the
+    installation that owns the event and is the isolation boundary used by
+    this deployment.
+    """
+
+    existing_tenant = session.scalar(
+        select(Chat.tenant_key).distinct().order_by(Chat.tenant_key).limit(1)
+    )
+    if existing_tenant is not None and existing_tenant != tenant_key:
+        raise TenantIsolationError(
+            "this database is already bound to another Feishu tenant"
         )
 
 

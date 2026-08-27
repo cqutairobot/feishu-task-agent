@@ -24,6 +24,7 @@ from app.database.models import (
     TaskAssignee,
     TaskLifecycleEvent,
     TaskNotification,
+    TaskNotificationDeferredLifecycleEvent,
     TaskNotificationState,
     User,
 )
@@ -852,6 +853,57 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
             TaskNotificationKind.TASK_INVALIDATED_ASSIGNEE.value,
         )
         self.assertEqual(row.recipient_open_id, "ou_owner")
+
+    def test_excluded_lifecycle_event_is_delivered_after_chat_is_admitted(self) -> None:
+        task_id = self._task(deadline=self.now + timedelta(days=1))
+        admitted = self._repository()
+        admitted.sync_all(synced_at=self.now)
+        self._lifecycle_event(task_id, action="complete", actor="ou_owner")
+        excluded = TaskNotificationRepository(
+            self.session_factory,
+            administrator_open_ids=frozenset({"ou_admin"}),
+            allowed_chat_ids=frozenset({"oc_static"}),
+            settings=ReminderSettings(),
+        )
+
+        skipped = excluded.sync_all(synced_at=self.now + timedelta(seconds=1))
+
+        self.assertEqual(skipped.created, 0)
+        with session_scope(self.session_factory) as session:
+            event = session.scalar(
+                select(TaskLifecycleEvent).where(
+                    TaskLifecycleEvent.task_id == task_id
+                )
+            )
+            assert event is not None
+            self.assertIsNotNone(
+                session.get(TaskNotificationDeferredLifecycleEvent, event.id)
+            )
+            state = session.get(TaskNotificationState, 1)
+            assert state is not None
+            self.assertEqual(state.last_lifecycle_event_id, event.id)
+
+        delivered = admitted.sync_all(
+            synced_at=self.now + timedelta(seconds=2)
+        )
+
+        self.assertEqual(delivered.created, 1)
+        with session_scope(self.session_factory) as session:
+            self.assertEqual(
+                session.scalar(
+                    select(TaskNotification.recipient_open_id).where(
+                        TaskNotification.task_id == task_id,
+                        TaskNotification.kind
+                        == TaskNotificationKind.TASK_DONE_ADMIN.value,
+                    )
+                ),
+                "ou_admin",
+            )
+            self.assertIsNone(
+                session.scalar(
+                    select(TaskNotificationDeferredLifecycleEvent)
+                )
+            )
 
     def test_overdue_notification_is_deadline_versioned_and_cancellable(self) -> None:
         task_id = self._task(

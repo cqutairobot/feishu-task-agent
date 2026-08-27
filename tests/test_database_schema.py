@@ -64,6 +64,7 @@ class DatabaseSchemaTest(unittest.TestCase):
                 "task_assignees",
                 "task_creation_events",
                 "task_notification_state",
+                "task_notification_deferred_lifecycle_events",
                 "task_notifications",
                 "management_login_tokens",
                 "management_sessions",
@@ -153,6 +154,14 @@ class DatabaseSchemaTest(unittest.TestCase):
                 "ck_chat_memberships_active_state",
                 "ck_chat_memberships_owner_active",
             },
+        )
+        self.assertEqual(
+            set(
+                inspector.get_pk_constraint(
+                    "task_notification_deferred_lifecycle_events"
+                )["constrained_columns"]
+            ),
+            {"event_id"},
         )
         self.assertEqual(
             {

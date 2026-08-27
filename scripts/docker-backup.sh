@@ -6,6 +6,17 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd -- "${script_dir}/.." && pwd -P)"
 backup_dir="${BACKUP_DIR:-${HOME}/feishu-task-agent-backups}"
 
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "Backup failed: neither sha256sum nor shasum is available." >&2
+    return 1
+  fi
+}
+
 cd "${repo_root}"
 
 if [[ ! -f .env ]]; then
@@ -105,7 +116,7 @@ PY
 )"
 
 docker compose cp "management-api:${container_path}" "${staging_path}"
-host_sha256="$(sha256sum "${staging_path}" | awk '{print $1}')"
+host_sha256="$(file_sha256 "${staging_path}")"
 
 if [[ "${container_sha256}" != "${host_sha256}" ]]; then
   echo "Backup failed: copied file checksum does not match container snapshot." >&2

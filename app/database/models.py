@@ -318,6 +318,12 @@ class ManagementSession(Base):
 
 
 class User(Base):
+    """One Feishu identity inside this database's single tenant boundary.
+
+    ``open_id`` is only safe as the primary key because message ingestion
+    rejects a second event tenant before users or chats are upserted.
+    """
+
     __tablename__ = "users"
 
     open_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -1336,6 +1342,20 @@ class TaskNotificationState(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class TaskNotificationDeferredLifecycleEvent(Base):
+    """Lifecycle event retained while its task's chat is not admitted."""
+
+    __tablename__ = "task_notification_deferred_lifecycle_events"
+
+    event_id: Mapped[int] = mapped_column(
+        ForeignKey("task_lifecycle_events.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    deferred_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), nullable=False, default=utc_now
     )
 
 
