@@ -1,283 +1,182 @@
 # 飞书群聊任务机器人
 
-一个从飞书群聊中识别任务、跟踪负责人和截止时间，并自动私聊提醒的任务机器人。
+一个运行在飞书群聊中的任务协作机器人：它从群消息和长会议纪要中识别任务，记录负责人、截止时间和来源证据，按任务编号跟踪进度，并通过私聊提醒负责人。管理员可以在管理后台查看任务、责任链和生命周期记录，验收完成结果或要求返工。
 
-群成员、任务负责人、飞书群主和群任务管理员请先阅读：
-[《用户使用手册》](USER_GUIDE.md)。手册完整说明首次启用、姓名绑定、任务识别、
-私聊操作、提醒规则、管理员后台、群设置、权限边界和常见问题。
+## 项目能做什么
 
-需要清空演示数据并按完整聊天场景展示功能，请阅读：
-[《完整演示与测试脚本》](USER_DEMO_SCRIPT.md)。该文档分别提供本地 Mac 原生运行和
-阿里云 Docker 部署的安全清库流程，以及长会议纪要、多任务、共同任务、生命周期、
-提醒和管理后台的完整演示步骤。
+- 读取已授权群的普通消息，无需每条消息都 `@机器人`。
+- 从多轮对话中识别单个或多个任务、负责人、截止时间和来源消息。
+- 为任务生成稳定编号，例如 `T-1A`，支持用编号进行查询和自然语言操作。
+- 支持多人共同任务、完成说明、来源证据、进度/阻塞/一般备注和完成周期。
+- 在任务新建、临近截止、到期、逾期或缺少截止时间时发送私聊提醒。
+- 负责人可以私聊机器人查看、完成、延期、取消任务，管理员可以验收或要求返工。
+- 记录发布者、负责人、实际完成人、复核人、操作原因、来源消息、通知投递和幂等键。
+- 提供按群隔离的管理后台，以及 SQLite 持久化和一致性备份脚本。
 
-第一次把项目部署到 Ubuntu 服务器，请阅读：
-[《Linux 部署指南》](LINUX_DEPLOYMENT_GUIDE.md)。该文档同时解释常用终端、Git 和
-Docker 命令的含义、预期结果及危险操作。
+## 运行方式
 
-中国大陆阿里云 ECS 无法稳定访问 Docker Hub 时，请直接使用已经实际验收通过的
-[《阿里云 ECS 部署指南》](ALIYUN_ECS_DEPLOYMENT_GUIDE.md)：在 OrbStack 构建
-`linux/amd64` 镜像，通过 SSH 上传到 ECS，再使用 Docker Compose 启动。
+项目提供两种运行方式：
 
-当前仓库提供原生 Python + Node.js 开发运行方式，适用于 macOS、Windows 和 Linux；
-同时提供面向 Linux 单机部署的生产镜像、Docker Compose 编排、同源网关和 SQLite
-持久卷，以及 SQLite 一致性备份、隔离恢复验证和阿里云 ECS 公网部署说明。
+1. **本地开发（推荐修改代码时使用）**：Python 虚拟环境运行后端和 Worker，Node.js 运行管理前端。`python -u -m app dev` 会在一个终端监督全部进程。
+2. **Docker Compose（推荐长期运行或 Linux/云服务器）**：容器内封装 Python、Node.js 和 Nginx 环境，数据保存在 Docker 命名卷中。
 
-## 主要能力
-
-- 无需 `@机器人`，保存授权群内的普通文本消息。
-- 结合最近群聊上下文识别负责人、任务内容、截止时间和证据消息。
-- 支持一句话多任务、多人共同任务和工作/生活两种识别范围。
-- 为任务分配稳定编号，例如 `T-1A`。
-- 新任务、临期、到期、逾期和缺少截止时间时优先私聊相关成员。
-- 负责人可私聊机器人追加进度、阻塞和备注，并用自然语言完成、取消或延期任务。
-- 负责人完成任务时可提交结果说明与来源证据；本群管理员可在后台验收该完成提交，
-  或填写原因要求返工并重新开启任务。复核人、返工原因、时间、完成周期和生命周期事件
-  均会保留，历史完成记录不会被覆盖。
-- 管理员也可通过带任务编号的自然语言验收或返工；高风险写入必须再次发送机器人给出的
-  “确认执行”完整确认句。
-- 管理后台按时间展示发布者、负责人、实际完成人、复核人、说明、历次完成和通知投递。
-- 群管理员可通过登录链接进入按群隔离的管理后台。
-- SQLite 持久化消息、任务、提醒、通知、权限和审计记录。
-
-## 当前运行结构
-
-原生开发模式的完整功能需要同时运行以下进程：
-
-1. 飞书 WebSocket Listener；
-2. 任务识别 Worker；
-3. 截止提醒 Worker；
-4. 任务通知 Worker；
-5. 管理 API；
-6. 管理前端。
-
-`python -m app dev` 会在一个终端中统一监督全部六个进程。关闭终端或电脑后程序会
-停止；Linux 长期部署应使用本文后面的 Docker Compose，容器会在后台运行并在主机
-重启后自动恢复。
+两种方式只能同时运行一套飞书 Listener；如果使用相同的飞书应用凭据同时启动，会造成重复处理消息。
 
 ## 系统要求
 
 - Git
-- Python `3.11`–`3.14`，推荐 Python `3.13`
-- Node.js `22.13` 或更高版本，附带 npm
-- 一个已发布的飞书企业自建应用
+- Python 3.11–3.14（推荐 3.13）
+- Node.js 22.13 或更高版本和 npm
+- 已发布并加入测试群的飞书企业自建应用
 - 一个支持 OpenAI Chat Completions 兼容接口和结构化 JSON 输出的模型服务
+- Docker 方式还需要 Docker Engine 和 Docker Compose v2
 
-安装前检查版本：
+检查版本：
 
-```text
+```bash
 git --version
-python --version
+python3 --version
 node --version
 npm --version
 ```
 
-## 1. 克隆仓库
+## 本地开发运行
 
-使用下面的地址克隆私有仓库；首次操作时 GitHub 会要求使用已获授权的账号：
+### 1. 获取代码并安装依赖
 
 ```bash
 git clone https://github.com/cqutairobot/feishu-task-agent.git
 cd feishu-task-agent
-```
 
-## 2. 安装后端
-
-### macOS 或 Linux
-
-```bash
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate       # Windows PowerShell: .\\.venv\\Scripts\\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.lock
-cp .env.example .env
-```
 
-### Windows PowerShell
-
-```powershell
-py -3.13 -m venv .venv
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.lock
-Copy-Item .env.example .env
-```
-
-如果 Windows 没有 `py` 启动器，可以将第一条命令替换为：
-
-```powershell
-python -m venv .venv
-```
-
-验证 Python 环境：
-
-```bash
-python -m app check
-```
-
-正常输出类似：
-
-```text
-Feishu Task Agent local runtime is ready. Python 3.13.x
-```
-
-## 3. 安装管理前端
-
-macOS、Windows 和 Linux 使用相同命令：
-
-```bash
 cd management-web
 npm ci
 cd ..
+
+cp .env.example .env            # Windows PowerShell: Copy-Item .env.example .env
 ```
 
-## 4. 配置飞书应用
+### 2. 配置 `.env`
 
-在飞书开放平台创建企业自建应用并启用机器人，然后完成：
-
-1. 申请“获取群组中所有消息”等读取权限，使普通群消息不需要 `@机器人`；
-2. 申请“以应用的身份发消息”权限；
-3. 使用长连接订阅 `im.message.receive_v1`；
-4. 按飞书控制台要求配置卡片交互回调；
-5. 创建版本、发布应用并完成企业管理员审批；
-6. 把机器人加入测试群。
-
-不同飞书版本显示的权限名称可能略有差异，请以开放平台中与群消息读取、应用消息
-发送、长连接事件和卡片交互相关的权限为准。
-
-## 5. 填写 `.env`
-
-只编辑项目根目录的 `.env`，不要修改或提交 `.env.example` 来保存真实密钥。
-
-至少填写：
+只编辑项目根目录的 `.env`，不要把真实密钥写入源码、提交到 Git 或放进镜像。最少填写：
 
 ```dotenv
-FEISHU_APP_ID=你的飞书App ID
-FEISHU_APP_SECRET=你的飞书App Secret
-
-TASK_LLM_API_KEY=你的模型API Key
-TASK_LLM_BASE_URL=你的OpenAI兼容接口地址
+FEISHU_APP_ID=你的飞书App_ID
+FEISHU_APP_SECRET=你的飞书App_Secret
+TASK_LLM_API_KEY=你的模型API_Key
+TASK_LLM_BASE_URL=https://你的OpenAI兼容服务/v1
 TASK_LLM_MODEL=你的模型名称
 ```
 
-首次接入新群时可以保持以下名单为空：
+首次开发可使用以下本地默认值：
 
 ```dotenv
-FEISHU_ALLOWED_CHAT_IDS=
-```
-
-空名单不会让任意群自动获得管理权限。新群仍需由当前群主显式执行“初始化本群”。
-如需只允许指定群，可在获取群 ID 后填写逗号分隔的 `chat_id`。
-
-自然语言普通生命周期写入与管理员复核写入使用两个独立开关：
-
-```dotenv
-LIFECYCLE_PRIVATE_WRITES_ENABLED=true
-LIFECYCLE_REVIEW_WRITES_ENABLED=false
-```
-
-第一项控制完成、延期、取消等既有私聊操作。第二项控制管理员自然语言“验收通过”和
-“重新开启”；它默认关闭，且只有第一项为 `true` 时才能开启。完成真实权限与确认流程
-验收后，可改为：
-
-```dotenv
-LIFECYCLE_PRIVATE_WRITES_ENABLED=true
-LIFECYCLE_REVIEW_WRITES_ENABLED=true
-```
-
-管理后台的验收和返工不受第二个私聊开关影响。无论从后台还是私聊执行，服务端都会再次
-校验任务所属群、管理员权限、当前完成周期、复核状态和幂等键。
-
-本地管理后台默认地址：
-
-```dotenv
+MANAGEMENT_WEB_ENABLED=true
 MANAGEMENT_WEB_PUBLIC_BASE_URL=http://127.0.0.1:8000
 MANAGEMENT_WEB_FRONTEND_URL=http://127.0.0.1:3000
 MANAGEMENT_WEB_BIND_HOST=127.0.0.1
 MANAGEMENT_WEB_PORT=8000
+LIFECYCLE_PRIVATE_WRITES_ENABLED=true
+LIFECYCLE_REVIEW_WRITES_ENABLED=false
 ```
 
-不要把本地配置直接改成公网监听。HTTPS 和公网访问将在正式部署阶段统一配置。
+`LIFECYCLE_REVIEW_WRITES_ENABLED` 控制管理员通过私聊执行“验收通过/重新开启”这类高风险写入，默认关闭；后台验收仍按后台权限和确认流程执行。`FEISHU_ALLOWED_CHAT_IDS` 可以留空，之后由群主在群内执行“初始化本群”。
 
-## 6. 检查配置和初始化数据库
+### 3. 检查配置并初始化数据库
 
-模型连接检查会真实调用一次你配置的模型接口：
+```bash
+source .venv/bin/activate
+python -m app check
+python -m app db-status
+```
+
+`data/feishu_task_agent.db` 是本地 SQLite 数据库，已经被 Git 忽略。`llm-check --probe` 会真实调用一次模型接口，确认模型配置可用：
 
 ```bash
 python -m app llm-check --probe
 ```
 
-创建或升级本地 SQLite 数据库，并显示非敏感计数：
+### 4. 启动完整服务
 
 ```bash
-python -m app db-status
-```
-
-默认数据库位于：
-
-```text
-data/feishu_task_agent.db
-```
-
-`data/` 已被 Git 忽略。
-
-任务溯源升级的最新迁移为 `20260831_0039`。已有部署升级前必须先创建并验证 SQLite
-一致性备份；完整步骤和回退边界分别见 [Linux 升级章节](LINUX_DEPLOYMENT_GUIDE.md#13-从-github-升级项目)
-和 [阿里云重新部署章节](ALIYUN_ECS_DEPLOYMENT_GUIDE.md#13-本地修复代码后的重新部署)。
-
-## 7. 启动完整程序
-
-先激活 Python 虚拟环境，然后在项目根目录用一个终端启动完整程序：
-
-```bash
+source .venv/bin/activate
 python -u -m app dev
 ```
 
-这个命令会先检查 Python 配置、Node.js/npm、前端依赖、`8000/3000` 端口并完成一次
-数据库迁移，再依次启动：
+该命令会启动并监督：
 
-- Listener
-- Detection Worker
-- Reminder Worker
-- Notification Worker
-- Management API
-- Management Web
+- 飞书 WebSocket Listener
+- 任务识别 Worker
+- 截止提醒 Worker
+- 任务通知 Worker
+- 管理 API（`http://127.0.0.1:8000`）
+- 管理前端（`http://127.0.0.1:3000`）
 
-日志行会带对应服务名前缀。任一必需进程异常退出时，其余服务会一起停止，避免留下
-只有部分功能在线的状态。Windows PowerShell 激活虚拟环境后使用相同命令。
+浏览器打开 `http://127.0.0.1:3000` 进入管理后台。按 `Ctrl+C` 会停止全部本地进程；关闭终端或电脑后本地服务也会停止。
 
-如果只想诊断 Python 后端而不启动网页，可以使用：
+只启动后端诊断时可用：
 
 ```bash
+source .venv/bin/activate
 python -u -m app dev-backend
 ```
 
-默认服务地址：
+### 5. 第一次群聊验收
 
-- 管理 API：`http://127.0.0.1:8000/health`
-- 管理前端：`http://127.0.0.1:3000`
-
-按一次 `Ctrl+C` 会统一停止全部六个进程。
-
-## 8. 首次群聊验收
-
-1. 当前飞书群主在群内发送：`@机器人 初始化本群`。
+1. 群主在目标群发送：`@机器人 初始化本群`。
 2. 每位成员发送：`@机器人 绑定姓名：自己的真实姓名`。
-3. 群内发送一条明确任务，例如：`王政，请在周五前完成登录页面。`
-4. 等待识别窗口和 Worker 处理，负责人应收到新任务私聊。
-5. 负责人私聊机器人发送：`任务列表`。
-6. 负责人私聊：`1A 已完成`，或点击任务卡片完成。
-7. 管理员私聊机器人发送：`管理后台`，使用一次性链接登录。
+3. 发送明确任务，例如：`王政，请在周五前完成登录页面。`。
+4. 负责人私聊机器人发送 `任务列表` 查看任务。
+5. 负责人私聊 `T-1A 已完成` 或点击任务卡片提交完成说明。
+6. 管理员私聊机器人发送 `管理后台`，使用机器人返回的一次性链接登录后台。
 
-进入管理后台后可以维护当前群的额外管理员；所有成员、任务和设置均按 `chat_id`
-隔离，不会把其他群的数据混入当前群。
+## Docker Compose 运行
 
-## 9. 运行测试
+Docker 方式适合 Linux 服务器或需要后台常驻的环境。先准备 `.env`，再在项目根目录执行：
+
+```bash
+docker compose config --quiet
+docker compose build
+docker compose up -d --wait --wait-timeout 180
+docker compose ps --all
+curl -fsS http://127.0.0.1:8080/health
+```
+
+默认入口是 `http://127.0.0.1:8080`。如果要让同一局域网或云服务器公网访问，在 `.env` 中设置：
+
+```dotenv
+DEPLOY_PUBLIC_URL=http://服务器IP:8080
+DEPLOY_BIND_HOST=0.0.0.0
+DEPLOY_HTTP_PORT=8080
+DEPLOY_IMAGE_TAG=local
+```
+
+常用命令：
+
+```bash
+docker compose logs --follow --tail 100  # 查看日志
+docker compose stop                       # 停止但保留容器和数据
+docker compose start                      # 重新启动
+docker compose restart                    # 重启
+docker compose down                       # 删除容器但保留命名卷
+```
+
+不要执行 `docker compose down --volumes`，除非你明确要删除数据库。数据库位于命名卷 `feishu-task-agent_task-data`，`.env` 只在运行时注入，不会复制进镜像。
+
+### Docker 镜像与中国大陆云服务器
+
+Docker 构建会从镜像仓库获取基础镜像；如果服务器访问 Docker Hub 超时，可以在本地构建 `linux/amd64` 镜像后用 `docker save | gzip` 导出，再通过 SSH/SCP 上传到服务器，用 `docker load` 导入并执行上面的 `docker compose up --no-build`。镜像只包含程序环境和代码，SQLite 数据仍在命名卷中，更新镜像不会覆盖数据库。
+
+## 测试
 
 后端完整回归：
 
 ```bash
+source .venv/bin/activate
 python -m unittest discover -s tests
 ```
 
@@ -287,136 +186,41 @@ python -m unittest discover -s tests
 cd management-web
 npm run lint
 npm test
-npm audit
 ```
 
-`npm test` 会执行一次生产构建并通过标准 Vinext 生产服务器验证渲染结果。首次发布前
-要求 `npm audit` 报告 0 个已知漏洞。
+## 更新代码后的基本流程
 
-## 10. Docker Compose 单机运行
-
-Docker Compose 会运行一次数据库迁移，并分别启动 Listener、三个 Worker、管理 API、
-管理前端和同源网关。开始前先停止原生 `python -m app dev`，避免同一个机器人被两套
-Listener 同时连接。
-
-本机 Docker Desktop 默认可以使用 `.env.example` 中的部署入口：
-
-```dotenv
-DEPLOY_PUBLIC_URL=http://127.0.0.1:8080
-DEPLOY_BIND_HOST=127.0.0.1
-DEPLOY_HTTP_PORT=8080
-DEPLOY_IMAGE_TAG=local
-```
-
-OrbStack Linux 虚拟机需要允许 Mac 访问虚拟机端口，并把公开地址换成实际机器名：
-
-```dotenv
-DEPLOY_PUBLIC_URL=http://feishu-server.orb.local:8080
-DEPLOY_BIND_HOST=0.0.0.0
-DEPLOY_HTTP_PORT=8080
-DEPLOY_IMAGE_TAG=local
-```
-
-校验、构建并后台启动：
+本地开发：
 
 ```bash
-docker compose config --quiet
+git pull --ff-only
+source .venv/bin/activate
+python -m pip install -r requirements.lock
+cd management-web && npm ci && cd ..
+python -u -m app dev
+```
+
+Docker Compose：
+
+```bash
+git pull --ff-only
 docker compose build
-docker compose up -d
+docker compose up -d --wait --wait-timeout 180
 docker compose ps --all
 ```
 
-预期 `migrate` 为 `Exited (0)`，其他七个服务为 `Up` 或 `healthy`。访问：
-
-- 完整管理入口：`DEPLOY_PUBLIC_URL`；
-- 健康检查：`DEPLOY_PUBLIC_URL/health`。
-
-常用运维命令：
-
-```bash
-docker compose logs --follow --tail 100
-docker compose stop
-docker compose start
-docker compose down
-```
-
-SQLite 保存在 Docker 命名卷 `feishu-task-agent_task-data`，普通 `stop`、`start`、
-`restart` 和 `down` 不会删除数据。不要执行 `docker compose down --volumes`，除非明确
-要永久删除该部署数据库。`.env` 仅在运行时注入，不会复制进镜像。
-
-### 创建 SQLite 一致性备份
-
-长期服务运行时不要直接复制命名卷里的数据库文件。仓库提供的备份命令会通过
-SQLite Backup API 创建一致性快照，执行完整性检查，核对容器内外 SHA-256，并以
-`0600` 权限保存到 Docker 卷之外：
-
-```bash
-./scripts/docker-backup.sh
-```
-
-默认保存目录是 `~/feishu-task-agent-backups`。也可以指定另一个位于持久磁盘上的目录：
-
-```bash
-BACKUP_DIR=/srv/feishu-task-agent/backups ./scripts/docker-backup.sh
-```
-
-命令输出 `backup_integrity: ok`、最终路径和 SHA-256 才表示备份成功。正式数据卷恢复
-工具会在后续阶段加入；在此之前不要手工用备份覆盖正在运行的数据库。
-
-可以先把任意一份备份恢复到一次性隔离卷，验证文件完整性、复制校验和、数据库迁移
-兼容性及应用读取能力。该命令不会停止服务，也不会挂载或修改正式数据卷：
-
-```bash
-./scripts/docker-verify-backup.sh \
-  ~/feishu-task-agent-backups/feishu-task-agent-20260824-190735.db
-```
-
-输出 `source_integrity: ok`、`restore_verification: ok` 和恢复后的非敏感数据计数才算
-通过；临时卷无论成功或失败都会清理。真正覆盖正式卷的灾难恢复工具仍在后续阶段
-加入。
+已有真实数据的部署，在更新前应先执行 `python -m app db-status` 和 `./scripts/docker-backup.sh`；不要删除数据卷。代码更新会运行数据库迁移，迁移失败时先停止发布并保留备份。
 
 ## 常见问题
 
-### 群消息没有被识别
+- **群消息没有识别**：确认 Listener、任务识别 Worker、飞书消息读取权限和群初始化状态。
+- **没有收到私聊**：负责人先私聊机器人发送一次 `任务列表`，并确认姓名已在来源群绑定。
+- **后台打不开**：确认管理 API、管理前端和 `.env` 中的管理后台开关与地址。
+- **端口被占用**：先在旧终端按 `Ctrl+C`，不要同时启动两套本地服务。
+- **Docker Hub 超时**：确认 Docker 镜像加速器，或采用本地构建后上传镜像的方式。
 
-- 确认 Listener 和任务识别 Worker 都在运行。
-- 确认机器人已经加入该群且应用版本已发布。
-- 确认飞书开放平台已经审批“获取群组中所有消息”权限。
-- 确认该群已经由群主初始化，或位于 `FEISHU_ALLOWED_CHAT_IDS` 中。
-- 任务识别默认有 20 秒上下文收集窗口，不会在发送后立即创建。
+## 安全提示
 
-### 创建任务但没有收到私聊
-
-- 确认任务通知 Worker 正在运行。
-- 让负责人先私聊机器人发送一次“任务列表”，建立可用私聊会话。
-- 检查负责人是否已经在任务来源群绑定唯一任务姓名。
-
-### 管理后台没有回复或无法打开
-
-- 确认管理 API 和管理前端都在运行。
-- 确认 `.env` 中 `MANAGEMENT_WEB_ENABLED=true`。
-- 确认发送者仍是目标群的有效管理员。
-- 本地登录链接只能在运行程序的同一台电脑上访问。
-
-### 端口被占用
-
-默认管理端口是 `8000` 和 `3000`。`dev` 会在启动前同时检查两个端口；如果提示
-地址不可用，先在旧的运行终端按 `Ctrl+C`，不要重复启动完整程序。`dev-backend`
-只检查后端使用的 `8000` 端口。
-
-### 提示缺少前端依赖
-
-确认已经执行：
-
-```bash
-cd management-web
-npm ci
-cd ..
-```
-
-## 数据和安全
-
-- `.env`、数据库、日志、虚拟环境和前端构建产物不会提交到 Git。
-- 不要把 App Secret、模型 API Key、真实 Open ID 或群 ID 写入源码和文档。
-- 本地数据库备份可以复制 `data/feishu_task_agent.db`，但不要上传到 GitHub。
-- 上传 GitHub 前应再次执行敏感信息扫描并检查待提交文件清单。
+- 不要提交 `.env`、飞书 App Secret、模型 API Key、真实 Open ID、群 ID 或 SQLite 数据库。
+- 生产环境应限制 SSH 和管理端口来源，不要长期把管理后台暴露给所有公网地址。
+- 备份数据库后再做迁移或升级，恢复操作必须使用隔离卷验证。
