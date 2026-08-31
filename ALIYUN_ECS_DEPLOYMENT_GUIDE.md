@@ -288,6 +288,7 @@ DEPLOY_IMAGE_TAG=local
 ```bash
 stat -c '%a %n' .env
 grep -E '^(DEPLOY_|MANAGEMENT_WEB_COOKIE_SECURE=)' .env
+grep -E '^LIFECYCLE_(PRIVATE|REVIEW)_WRITES_ENABLED=' .env
 docker compose config --quiet && echo "compose config: ok"
 docker compose config --services
 git status --short
@@ -546,6 +547,10 @@ echo
 4. 重新执行本文第 8 节构建镜像；
 5. 重新执行第 9 节生成并上传镜像包。
 
+发布包的版本文件必须保存完整 Git 提交号。后端、管理前端或网关任一代码发生变化时，
+必须重新构建对应镜像；为了减少人工漏判，正式发布建议仍统一打包三个项目镜像。镜像不
+包含 SQLite 命名卷和 `.env`，因此更新镜像不会同步或覆盖云端业务数据。
+
 不要只上传源码而继续使用旧镜像，因为容器内运行的是镜像中的代码，不会自动读取
 服务器项目目录里的 Python 或前端源码。
 
@@ -553,10 +558,16 @@ echo
 
 ```bash
 cd ~/feishu-task-agent-release
+OLD_RELEASE=$(git rev-parse --short=7 HEAD)
+echo "$OLD_RELEASE"
+docker compose exec -T management-api python -m app db-status \
+  | tee "$HOME/feishu-task-agent-backups/pre-${OLD_RELEASE}-db-status.txt"
 ./scripts/docker-backup.sh
+LATEST_BACKUP=$(ls -1t "$HOME"/feishu-task-agent-backups/feishu-task-agent-*.db | head -n 1)
+./scripts/docker-verify-backup.sh "$LATEST_BACKUP"
 ```
 
-只有输出 `backup_integrity: ok`、备份路径和 SHA-256 才算成功。
+只有备份与隔离恢复同时输出完整性 `ok`、备份路径和 SHA-256 才继续。
 
 ### 13.3 ECS 更新源码和镜像
 
@@ -567,7 +578,36 @@ git pull --ff-only
 git log -1 --oneline
 ```
 
-然后执行本文第 10 节的校验、`docker load` 和带 `--force-recreate` 的启动命令。
+核对源码与上传镜像包来自同一提交：
+
+```bash
+RELEASE_SHORT=$(git rev-parse --short=7 HEAD)
+RELEASE_DIR="$HOME/feishu-task-agent-releases/${RELEASE_SHORT}"
+test "$(cat "$RELEASE_DIR"/*.version.txt | sort -u)" = "$(git rev-parse HEAD)" \
+  && echo "version match: ok"
+sha256sum "$RELEASE_DIR"/*.tar.gz
+```
+
+如果没有看到 `version match: ok`，停止部署，不要混用旧镜像和新源码。然后检查 Phase 9
+复核开关：
+
+```bash
+grep -E '^LIFECYCLE_(PRIVATE|REVIEW)_WRITES_ENABLED=' .env
+```
+
+需要在阿里云启用自然语言验收和返工时，两项都设为 `true`；若暂不启用高风险私聊写入，
+第二项保持 `false`。随后执行本文第 10 节的 `docker load`，并切换容器：
+
+```bash
+docker compose config --quiet
+docker compose up \
+  -d \
+  --no-build \
+  --force-recreate \
+  --wait \
+  --wait-timeout 180
+```
+
 Docker 命名卷与镜像独立，因此正常更新不会清空 SQLite 数据。
 
 更新后检查：
@@ -577,7 +617,24 @@ docker compose ps --all
 curl -fsS http://127.0.0.1:8080/health
 echo
 docker compose exec -T management-api python -m app db-status
+docker compose exec -T management-api python -c '
+import sqlite3
+db = sqlite3.connect("/app/data/feishu_task_agent.db")
+print("schema_version:", db.execute("SELECT version_num FROM alembic_version").fetchone()[0])
+'
 ```
+
+任务溯源版本应显示 `schema_version: 20260831_0039`。飞书最小验收依次为：负责人追加进度、
+带说明完成、管理员按两次消息确认验收、后台查看两类记录。若要验收返工，再使用专门测试
+任务执行“重新开启并填写原因”，不要拿重要正式任务试验。
+
+### 13.4 阿里云回退边界
+
+升级前为三个现有镜像保留带旧提交号的标签，且不要删除上传的旧发布包。新容器启动失败
+而尚未产生新业务写入时，可以重新把旧镜像标记为 Compose 使用的标签，再以 `--no-build`
+重建容器。若迁移后已产生新的说明、完成周期或复核记录，应用回退与数据库回退必须分开
+评估；不要运行 `alembic downgrade`，不要删除命名卷，也不要把备份直接覆盖运行中的
+数据库。仓库当前的验证脚本只恢复到隔离卷，正式数据恢复需停机并按单独灾难恢复流程执行。
 
 ## 14. 常见问题
 

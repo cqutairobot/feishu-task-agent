@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
+import hashlib
 import json
 import math
 import unicodedata
@@ -22,9 +23,11 @@ from app.database.models import (
     Message,
     Task,
     TaskAssignee,
+    TaskCompletionSubmission,
     TaskEvidence,
     TaskLifecycleEvent,
     TaskLifecycleEvidence,
+    TaskNote,
     TaskNotification,
     TaskSource,
     User,
@@ -32,11 +35,13 @@ from app.database.models import (
 from app.agent.contracts import MAX_TASK_ASSIGNEES, TaskOwner
 from app.identity.aliases import normalize_alias
 from app.lifecycle.contracts import LifecycleAction, LifecycleCandidate
+from app.lifecycle.review_contracts import ReviewAction, ReviewActionCandidate
 from app.reminders.repository import sync_task_reminders_in_session
 from app.notifications.repository import (
     create_task_assignment_notifications_in_session,
 )
 from app.tasks.codes import TaskCodeError, format_task_code, parse_task_code
+from app.tasks.notes import MAX_TASK_NOTE_CONTENT_LENGTH
 from app.tasks.repository import TaskStatus
 
 
@@ -80,6 +85,18 @@ class LifecycleModelAudit:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LifecycleAudit:
+    actor_name: str
+    source_message_id: str | None
+    correlation_id: str
+    idempotency_key: str
+    from_review_status: str
+    to_review_status: str
+    completion_cycle: int
+    completion_note_id: int | None
 
 
 class LifecycleMutationService:
@@ -215,6 +232,27 @@ class LifecycleMutationService:
                 candidate,
                 applied_at=applied_at,
             )
+            lifecycle_audit = _record_lifecycle_audit(
+                session,
+                task,
+                action=candidate.action,
+                actor_open_id=actor_open_id,
+                applied_at=applied_at,
+                source_message_id=trigger.message_id,
+                content_snapshot=trigger.text_content,
+                evidence_message_ids=candidate.evidence_message_ids,
+                correlation_id=(
+                    model_audit.request_id
+                    if model_audit is not None and model_audit.request_id
+                    else trigger.event_id
+                ),
+                idempotency_key=_lifecycle_idempotency_key(
+                    "message", task.id, trigger.id
+                ),
+                completion_note_source=trigger,
+                model_audit=model_audit,
+                confidence=candidate.confidence,
+            )
             title_after = (
                 task.title if candidate.action is LifecycleAction.RENAME else None
             )
@@ -226,7 +264,11 @@ class LifecycleMutationService:
             event = TaskLifecycleEvent(
                 task_id=task.id,
                 actor_open_id=actor_open_id,
+                actor_name_snapshot=lifecycle_audit.actor_name,
                 trigger_message_db_id=trigger.id,
+                source_message_id=lifecycle_audit.source_message_id,
+                correlation_id=lifecycle_audit.correlation_id,
+                idempotency_key=lifecycle_audit.idempotency_key,
                 action=candidate.action.value,
                 authorization_role=authorization.value,
                 task_code_snapshot=format_task_code(task.id),
@@ -238,6 +280,9 @@ class LifecycleMutationService:
                 title_after=title_after,
                 assignees_before_json=_owners_json_or_none(assignees_before),
                 assignees_after_json=_owners_json_or_none(assignees_after),
+                from_review_status=lifecycle_audit.from_review_status,
+                to_review_status=lifecycle_audit.to_review_status,
+                completion_cycle=lifecycle_audit.completion_cycle,
                 confidence=candidate.confidence,
                 provider=(None if model_audit is None else model_audit.provider),
                 model=(None if model_audit is None else model_audit.model),
@@ -292,6 +337,218 @@ class LifecycleMutationService:
                 title_after=title_after,
                 assignees_before=assignees_before,
                 assignees_after=assignees_after,
+                reminders_created=reminder_result.created,
+                reminders_cancelled=reminder_result.cancelled,
+                already_applied=False,
+                applied_at=applied_at,
+            )
+
+    def apply_private_review_action(
+        self,
+        candidate: ReviewActionCandidate,
+        *,
+        actor_open_id: str,
+        trigger_message_id: str,
+        task_code: str | None = None,
+        applied_at: datetime,
+        model_audit: LifecycleModelAudit | None = None,
+    ) -> LifecycleMutationResult:
+        """Atomically apply one explicitly confirmed private review action.
+
+        This path is intentionally separate from ordinary owner lifecycle
+        updates. It requires an administrator, a completed reviewable task and
+        a P2P trigger message from that same administrator. The trigger message
+        is recorded as a normal message-source lifecycle event so the complete
+        audit trail remains tied to the human confirmation.
+        """
+
+        candidate = _validate_review_candidate(candidate, self._minimum_confidence)
+        actor_open_id = _required_text(actor_open_id, "actor_open_id", 128)
+        trigger_message_id = _required_text(
+            trigger_message_id, "trigger_message_id", 128
+        )
+        applied_at = _aware_utc(applied_at, "applied_at")
+        model_audit = _validate_model_audit(model_audit)
+        expected_task_id = _optional_task_code(task_code)
+        if expected_task_id is not None and expected_task_id != candidate.task_id:
+            raise LifecycleMutationError(
+                "task code does not match the review candidate task_id"
+            )
+
+        action = LifecycleAction(candidate.action.value)
+        with session_scope(self._session_factory) as session:
+            connection = session.connection()
+            if connection.dialect.name == "sqlite":
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            task = session.get(Task, candidate.task_id)
+            if task is None:
+                raise LifecycleMutationError(
+                    f"task {candidate.task_id} does not exist"
+                )
+            if not _chat_is_admitted(
+                session, task.chat_id, self._allowed_chat_ids
+            ):
+                raise LifecycleMutationError(
+                    "task belongs to a chat outside the configured allowlist"
+                )
+            if not self._is_administrator(session, task.chat_id, actor_open_id):
+                raise LifecycleMutationError(
+                    "private review actions require an authorized administrator"
+                )
+            trigger = _unique_message(session, trigger_message_id)
+            trigger_chat = session.get(Chat, trigger.chat_id)
+            if trigger_chat is None:
+                raise LifecycleMutationError("trigger message chat does not exist")
+            _validate_trigger(
+                trigger,
+                trigger_chat,
+                task,
+                actor_open_id=actor_open_id,
+                applied_at=applied_at,
+            )
+            if trigger_chat.chat_type != "p2p":
+                raise LifecycleMutationError(
+                    "private review trigger must come from a P2P chat"
+                )
+            evidence = _load_evidence(
+                session,
+                candidate.evidence_message_ids,
+                trigger=trigger,
+            )
+            existing = session.scalar(
+                select(TaskLifecycleEvent).where(
+                    TaskLifecycleEvent.task_id == task.id,
+                    TaskLifecycleEvent.trigger_message_db_id == trigger.id,
+                )
+            )
+            if existing is not None:
+                _validate_private_review_replay(
+                    existing,
+                    candidate=candidate,
+                    actor_open_id=actor_open_id,
+                    evidence=evidence,
+                )
+                return _result(existing, already_applied=True)
+
+            previous_status = _management_previous_status(task, action)
+            deadline_before = task.deadline
+            lifecycle_candidate = LifecycleCandidate(
+                action=action,
+                confidence=candidate.confidence,
+                task_id=task.id,
+                new_deadline=None,
+                evidence_message_ids=candidate.evidence_message_ids,
+            )
+            new_status, deadline_after = _apply_transition(
+                session,
+                task,
+                lifecycle_candidate,
+                applied_at=applied_at,
+            )
+            correlation_id = (
+                model_audit.request_id
+                if model_audit is not None and model_audit.request_id
+                else trigger.event_id
+            )
+            idempotency_key = _lifecycle_idempotency_key(
+                "private_review", task.id, trigger.id
+            )
+            lifecycle_audit = _record_lifecycle_audit(
+                session,
+                task,
+                action=action,
+                actor_open_id=actor_open_id,
+                applied_at=applied_at,
+                source_message_id=trigger.message_id,
+                source_chat_id=trigger.chat_id,
+                content_snapshot=trigger.text_content,
+                evidence_message_ids=tuple(
+                    message.message_id for message in evidence
+                ),
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+                model_audit=model_audit,
+                confidence=candidate.confidence,
+                reason=candidate.reason,
+            )
+            event = TaskLifecycleEvent(
+                task_id=task.id,
+                actor_open_id=actor_open_id,
+                actor_name_snapshot=lifecycle_audit.actor_name,
+                trigger_source="message",
+                trigger_message_db_id=trigger.id,
+                source_message_id=lifecycle_audit.source_message_id,
+                correlation_id=lifecycle_audit.correlation_id,
+                idempotency_key=lifecycle_audit.idempotency_key,
+                action=action.value,
+                authorization_role=LifecycleAuthorizationRole.ADMINISTRATOR.value,
+                task_code_snapshot=format_task_code(task.id),
+                previous_status=previous_status.value,
+                new_status=new_status.value,
+                deadline_before=deadline_before,
+                deadline_after=deadline_after,
+                title_before=None,
+                title_after=None,
+                assignees_before_json=None,
+                assignees_after_json=None,
+                from_review_status=lifecycle_audit.from_review_status,
+                to_review_status=lifecycle_audit.to_review_status,
+                reason=candidate.reason,
+                completion_cycle=lifecycle_audit.completion_cycle,
+                confidence=candidate.confidence,
+                provider=(None if model_audit is None else model_audit.provider),
+                model=(None if model_audit is None else model_audit.model),
+                response_format=(
+                    None if model_audit is None else model_audit.response_format
+                ),
+                model_request_id=(
+                    None if model_audit is None else model_audit.request_id
+                ),
+                prompt_tokens=(
+                    None if model_audit is None else model_audit.prompt_tokens
+                ),
+                completion_tokens=(
+                    None
+                    if model_audit is None
+                    else model_audit.completion_tokens
+                ),
+                total_tokens=(
+                    None if model_audit is None else model_audit.total_tokens
+                ),
+                applied_at=applied_at,
+                created_at=applied_at,
+            )
+            session.add(event)
+            session.flush()
+            session.add_all(
+                TaskLifecycleEvidence(
+                    event_id=event.id,
+                    message_db_id=message.id,
+                    position=position,
+                )
+                for position, message in enumerate(evidence)
+            )
+            reminder_result = sync_task_reminders_in_session(
+                session,
+                task,
+                synced_at=applied_at,
+                settings=self._reminder_settings,
+            )
+            session.flush()
+            return LifecycleMutationResult(
+                event_id=event.id,
+                task_id=task.id,
+                task_code=event.task_code_snapshot,
+                action=action,
+                authorization_role=LifecycleAuthorizationRole.ADMINISTRATOR,
+                previous_status=previous_status,
+                new_status=TaskStatus(task.status),
+                deadline_before=deadline_before,
+                deadline_after=task.deadline,
+                title_before=None,
+                title_after=None,
+                assignees_before=(),
+                assignees_after=(),
                 reminders_created=reminder_result.created,
                 reminders_cancelled=reminder_result.cancelled,
                 already_applied=False,
@@ -399,14 +656,32 @@ class LifecycleMutationService:
                 candidate,
                 applied_at=applied_at,
             )
+            lifecycle_audit = _record_lifecycle_audit(
+                session,
+                task,
+                action=action,
+                actor_open_id=actor_open_id,
+                applied_at=applied_at,
+                source_message_id=card_message_id,
+                content_snapshot="通过任务卡片标记完成",
+                evidence_message_ids=(card_message_id,),
+                correlation_id=callback_id,
+                idempotency_key=_lifecycle_idempotency_key(
+                    "card_action", callback_id
+                ),
+            )
             event = TaskLifecycleEvent(
                 task_id=task.id,
                 actor_open_id=actor_open_id,
+                actor_name_snapshot=lifecycle_audit.actor_name,
                 trigger_source="card_action",
                 trigger_message_db_id=None,
                 trigger_card_action_id=callback_id,
                 trigger_card_message_id=card_message_id,
                 trigger_card_chat_id=card_chat_id,
+                source_message_id=lifecycle_audit.source_message_id,
+                correlation_id=lifecycle_audit.correlation_id,
+                idempotency_key=lifecycle_audit.idempotency_key,
                 action=action.value,
                 authorization_role=authorization.value,
                 task_code_snapshot=format_task_code(task.id),
@@ -418,6 +693,9 @@ class LifecycleMutationService:
                 title_after=None,
                 assignees_before_json=None,
                 assignees_after_json=None,
+                from_review_status=lifecycle_audit.from_review_status,
+                to_review_status=lifecycle_audit.to_review_status,
+                completion_cycle=lifecycle_audit.completion_cycle,
                 confidence=1.0,
                 applied_at=applied_at,
                 created_at=applied_at,
@@ -464,6 +742,7 @@ class LifecycleMutationService:
         new_title: str | None = None,
         new_owner_open_ids: tuple[str, ...] = (),
         merge_target_task_id: int | None = None,
+        reason: str | None = None,
     ) -> LifecycleMutationResult:
         """Apply an explicit administrator action from the management page.
 
@@ -475,6 +754,8 @@ class LifecycleMutationService:
         if action not in {
             LifecycleAction.CONFIRM,
             LifecycleAction.COMPLETE,
+            LifecycleAction.ACCEPT,
+            LifecycleAction.REOPEN,
             LifecycleAction.CANCEL,
             LifecycleAction.INVALIDATE,
             LifecycleAction.RESCHEDULE,
@@ -485,6 +766,13 @@ class LifecycleMutationService:
         }:
             raise LifecycleMutationError(
                 "this management action is not supported in the current phase"
+            )
+        normalized_reason = None
+        if action is LifecycleAction.REOPEN:
+            normalized_reason = _management_reason(reason)
+        elif reason is not None:
+            raise LifecycleMutationError(
+                f"management {action.value} does not accept a reason"
             )
         if action is LifecycleAction.RESCHEDULE:
             if (
@@ -623,6 +911,7 @@ class LifecycleMutationService:
                     new_title=new_title,
                     new_owner_open_ids=new_owner_open_ids,
                     merge_target_task_id=merge_target_task_id,
+                    reason=normalized_reason,
                 )
                 return _result(existing, already_applied=True)
 
@@ -633,7 +922,7 @@ class LifecycleMutationService:
                 raise LifecycleMutationError(
                     "merged tasks cannot receive another lifecycle action"
                 )
-            previous_status = _management_previous_status(task.status, action)
+            previous_status = _management_previous_status(task, action)
             merge_target = None
             if action is LifecycleAction.MERGE:
                 assert merge_target_task_id is not None
@@ -692,6 +981,21 @@ class LifecycleMutationService:
                 applied_at=applied_at,
                 merge_target=merge_target,
             )
+            lifecycle_audit = _record_lifecycle_audit(
+                session,
+                task,
+                action=action,
+                actor_open_id=actor_open_id,
+                applied_at=applied_at,
+                source_message_id=None,
+                content_snapshot="管理员在管理后台标记任务完成",
+                evidence_message_ids=(),
+                correlation_id=request_id,
+                idempotency_key=_lifecycle_idempotency_key(
+                    "management_page", request_id
+                ),
+                reason=normalized_reason,
+            )
             if action is LifecycleAction.MERGE:
                 assert merge_target is not None
                 _merge_task_provenance(session, task, merge_target)
@@ -712,12 +1016,16 @@ class LifecycleMutationService:
             event = TaskLifecycleEvent(
                 task_id=task.id,
                 actor_open_id=actor_open_id,
+                actor_name_snapshot=lifecycle_audit.actor_name,
                 trigger_source="management_page",
                 trigger_message_db_id=None,
                 trigger_card_action_id=None,
                 trigger_card_message_id=None,
                 trigger_card_chat_id=None,
                 trigger_management_request_id=request_id,
+                source_message_id=lifecycle_audit.source_message_id,
+                correlation_id=lifecycle_audit.correlation_id,
+                idempotency_key=lifecycle_audit.idempotency_key,
                 action=action.value,
                 authorization_role=authorization.value,
                 task_code_snapshot=format_task_code(task.id),
@@ -729,6 +1037,10 @@ class LifecycleMutationService:
                 title_after=title_after,
                 assignees_before_json=_owners_json_or_none(assignees_before),
                 assignees_after_json=_owners_json_or_none(assignees_after),
+                from_review_status=lifecycle_audit.from_review_status,
+                to_review_status=lifecycle_audit.to_review_status,
+                reason=normalized_reason,
+                completion_cycle=lifecycle_audit.completion_cycle,
                 merge_target_task_id=merge_target_task_id,
                 confidence=1.0,
                 applied_at=applied_at,
@@ -784,6 +1096,7 @@ class LifecycleMutationService:
             LifecycleAction.RENAME,
             LifecycleAction.REASSIGN,
             LifecycleAction.INVALIDATE,
+            LifecycleAction.REOPEN,
         }:
             if self._is_administrator(session, task.chat_id, actor_open_id):
                 return LifecycleAuthorizationRole.ADMINISTRATOR
@@ -835,6 +1148,10 @@ def _validate_candidate(
     if candidate.action is LifecycleAction.MERGE:
         raise LifecycleMutationError(
             "task merging is available only from the management page"
+        )
+    if candidate.action is LifecycleAction.REOPEN:
+        raise LifecycleMutationError(
+            "task reopening is available only from the management page"
         )
     if (
         isinstance(candidate.task_id, bool)
@@ -913,6 +1230,71 @@ def _validate_candidate(
     return candidate
 
 
+def _validate_review_candidate(
+    candidate: ReviewActionCandidate, minimum_confidence: float
+) -> ReviewActionCandidate:
+    """Validate the narrow candidate accepted by the private review gate."""
+
+    if not isinstance(candidate, ReviewActionCandidate):
+        raise LifecycleMutationError(
+            "candidate must be a ReviewActionCandidate"
+        )
+    if not isinstance(candidate.action, ReviewAction):
+        raise LifecycleMutationError("review candidate action is invalid")
+    if (
+        isinstance(candidate.task_id, bool)
+        or not isinstance(candidate.task_id, int)
+        or candidate.task_id < 1
+    ):
+        raise LifecycleMutationError("review candidate task_id must be positive")
+    if (
+        isinstance(candidate.confidence, bool)
+        or not isinstance(candidate.confidence, (int, float))
+        or not math.isfinite(float(candidate.confidence))
+        or not 0 <= float(candidate.confidence) <= 1
+    ):
+        raise LifecycleMutationError("review candidate confidence is invalid")
+    if candidate.confidence < minimum_confidence:
+        raise LifecycleMutationError(
+            "review candidate confidence is below the mutation threshold"
+        )
+    if not isinstance(candidate.evidence_message_ids, tuple) or not candidate.evidence_message_ids:
+        raise LifecycleMutationError("review candidate evidence must be non-empty")
+    if any(
+        not isinstance(message_id, str) or not message_id.strip()
+        for message_id in candidate.evidence_message_ids
+    ):
+        raise LifecycleMutationError("review evidence IDs must not be empty")
+    if len(set(candidate.evidence_message_ids)) != len(
+        candidate.evidence_message_ids
+    ):
+        raise LifecycleMutationError("review evidence must be unique")
+
+    normalized_reason: str | None = None
+    if candidate.action is ReviewAction.ACCEPT:
+        if candidate.reason is not None:
+            raise LifecycleMutationError("accept review must not include a reason")
+    else:
+        if not isinstance(candidate.reason, str):
+            raise LifecycleMutationError("reopen review requires a reason")
+        normalized_reason = " ".join(
+            unicodedata.normalize("NFC", candidate.reason).split()
+        )
+        if not normalized_reason or len(normalized_reason) > 2_000:
+            raise LifecycleMutationError(
+                "reopen review reason must contain 1 to 2000 characters"
+            )
+    return ReviewActionCandidate(
+        action=candidate.action,
+        confidence=float(candidate.confidence),
+        task_id=candidate.task_id,
+        reason=normalized_reason,
+        evidence_message_ids=tuple(
+            message_id.strip() for message_id in candidate.evidence_message_ids
+        ),
+    )
+
+
 def _validate_trigger(
     trigger: Message,
     trigger_chat: Chat,
@@ -987,9 +1369,9 @@ def _actionable_status(value: str) -> TaskStatus:
 
 
 def _management_previous_status(
-    value: str, action: LifecycleAction
+    task: Task, action: LifecycleAction
 ) -> TaskStatus:
-    status = TaskStatus(value)
+    status = TaskStatus(task.status)
     if action is LifecycleAction.CONFIRM:
         if status is not TaskStatus.PENDING:
             raise LifecycleMutationError(
@@ -997,6 +1379,26 @@ def _management_previous_status(
             )
         return status
     if action is LifecycleAction.INVALIDATE and status is TaskStatus.PENDING:
+        return status
+    if action is LifecycleAction.ACCEPT:
+        if (
+            status is not TaskStatus.DONE
+            or task.review_status != "pending"
+            or task.completion_cycle < 1
+        ):
+            raise LifecycleMutationError(
+                "only completed tasks awaiting review can be accepted"
+            )
+        return status
+    if action is LifecycleAction.REOPEN:
+        if (
+            status is not TaskStatus.DONE
+            or task.review_status not in {"pending", "accepted"}
+            or task.completion_cycle < 1
+        ):
+            raise LifecycleMutationError(
+                "only completed tasks with a review result can be reopened"
+            )
         return status
     if action is LifecycleAction.RESTORE:
         if status not in {TaskStatus.DONE, TaskStatus.CANCELLED}:
@@ -1015,7 +1417,7 @@ def _management_previous_status(
                 "only open or completed tasks can be merged"
             )
         return status
-    return _actionable_status(value)
+    return _actionable_status(task.status)
 
 
 def _apply_transition(
@@ -1033,6 +1435,18 @@ def _apply_transition(
     elif candidate.action is LifecycleAction.COMPLETE:
         task.status = TaskStatus.DONE.value
         task.completed_at = applied_at
+        task.cancelled_at = None
+    elif candidate.action is LifecycleAction.ACCEPT:
+        # Acceptance is a quality gate over the current completion submission;
+        # the task remains completed while its review state advances.
+        pass
+    elif candidate.action is LifecycleAction.REOPEN:
+        task.status = (
+            TaskStatus.OVERDUE.value
+            if task.deadline is not None and task.deadline <= applied_at
+            else TaskStatus.TODO.value
+        )
+        task.completed_at = None
         task.cancelled_at = None
     elif candidate.action in {
         LifecycleAction.CANCEL,
@@ -1087,6 +1501,211 @@ def _apply_transition(
     return TaskStatus(task.status), task.deadline
 
 
+def _record_lifecycle_audit(
+    session: Session,
+    task: Task,
+    *,
+    action: LifecycleAction,
+    actor_open_id: str,
+    applied_at: datetime,
+    source_message_id: str | None,
+    content_snapshot: str | None,
+    evidence_message_ids: tuple[str, ...],
+    correlation_id: str,
+    idempotency_key: str,
+    source_chat_id: str | None = None,
+    completion_note_source: Message | None = None,
+    model_audit: LifecycleModelAudit | None = None,
+    confidence: float | None = None,
+    reason: str | None = None,
+) -> _LifecycleAudit:
+    """Resolve actor/source audit and persist completion details when needed."""
+
+    actor_name = _actor_name(session, task, actor_open_id)
+    from_review_status = task.review_status
+    completion_cycle = task.completion_cycle
+    completion_note_id = None
+    if action is LifecycleAction.COMPLETE:
+        completion_cycle += 1
+        cleaned_content = (
+            content_snapshot.strip()
+            if isinstance(content_snapshot, str) and content_snapshot.strip()
+            else "通过飞书消息标记任务完成"
+        )
+
+        task.review_status = "pending"
+        task.reviewed_by_open_id = None
+        task.reviewed_by_name = None
+        task.reviewed_at = None
+        task.completion_cycle = completion_cycle
+        task.last_completed_by_open_id = actor_open_id
+        task.last_completed_by_name = actor_name
+        task.last_completed_at = applied_at
+
+        if completion_note_source is not None:
+            completion_note = TaskNote(
+                task_id=task.id,
+                chat_id=task.chat_id,
+                author_open_id=actor_open_id,
+                author_name_snapshot=actor_name,
+                note_type="completion",
+                content=_completion_note_content(cleaned_content),
+                source_message_id=completion_note_source.message_id,
+                source_chat_id=completion_note_source.chat_id,
+                completion_cycle=completion_cycle,
+                idempotency_key=f"{idempotency_key}:completion-note",
+                confidence=confidence,
+                provider=(
+                    None if model_audit is None else model_audit.provider
+                ),
+                model=None if model_audit is None else model_audit.model,
+                response_format=(
+                    None
+                    if model_audit is None
+                    else model_audit.response_format
+                ),
+                model_request_id=(
+                    None if model_audit is None else model_audit.request_id
+                ),
+                prompt_tokens=(
+                    None if model_audit is None else model_audit.prompt_tokens
+                ),
+                completion_tokens=(
+                    None
+                    if model_audit is None
+                    else model_audit.completion_tokens
+                ),
+                total_tokens=(
+                    None if model_audit is None else model_audit.total_tokens
+                ),
+                created_at=applied_at,
+            )
+            session.add(completion_note)
+            session.flush()
+            completion_note_id = completion_note.id
+
+        session.add(
+            TaskCompletionSubmission(
+                task_id=task.id,
+                chat_id=task.chat_id,
+                cycle=completion_cycle,
+                submitted_by_open_id=actor_open_id,
+                submitted_by_name_snapshot=actor_name,
+                source_message_id=source_message_id,
+                completion_note_id=completion_note_id,
+                content_snapshot=cleaned_content,
+                evidence_json=json.dumps(
+                    list(evidence_message_ids),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                submitted_at=applied_at,
+                review_status="pending",
+                idempotency_key=idempotency_key,
+            )
+        )
+    elif action is LifecycleAction.ACCEPT:
+        submission = session.scalar(
+            select(TaskCompletionSubmission).where(
+                TaskCompletionSubmission.task_id == task.id,
+                TaskCompletionSubmission.cycle == task.completion_cycle,
+            )
+        )
+        if submission is None or submission.review_status != "pending":
+            raise LifecycleMutationError(
+                "current completion submission is not awaiting review"
+            )
+        task.review_status = "accepted"
+        task.reviewed_by_open_id = actor_open_id
+        task.reviewed_by_name = actor_name
+        task.reviewed_at = applied_at
+        submission.review_status = "accepted"
+        submission.reviewed_by_open_id = actor_open_id
+        submission.reviewed_at = applied_at
+        submission.review_reason = None
+    elif action is LifecycleAction.REOPEN:
+        normalized_reason = _management_reason(reason)
+        submission = session.scalar(
+            select(TaskCompletionSubmission).where(
+                TaskCompletionSubmission.task_id == task.id,
+                TaskCompletionSubmission.cycle == task.completion_cycle,
+            )
+        )
+        if submission is None or submission.review_status not in {
+            "pending",
+            "accepted",
+        }:
+            raise LifecycleMutationError(
+                "current completion submission cannot be reopened"
+            )
+        task.review_status = "rework_required"
+        task.reviewed_by_open_id = actor_open_id
+        task.reviewed_by_name = actor_name
+        task.reviewed_at = applied_at
+        submission.review_status = "rework_required"
+        submission.reviewed_by_open_id = actor_open_id
+        submission.reviewed_at = applied_at
+        submission.review_reason = normalized_reason
+        session.add(
+            TaskNote(
+                task_id=task.id,
+                chat_id=task.chat_id,
+                author_open_id=actor_open_id,
+                author_name_snapshot=actor_name,
+                note_type="reopen",
+                content=_completion_note_content(normalized_reason),
+                source_message_id=source_message_id,
+                source_chat_id=source_chat_id or task.chat_id,
+                completion_cycle=task.completion_cycle,
+                idempotency_key=f"{idempotency_key}:reopen-note",
+                created_at=applied_at,
+            )
+        )
+        session.flush()
+    return _LifecycleAudit(
+        actor_name=actor_name,
+        source_message_id=source_message_id,
+        correlation_id=correlation_id,
+        idempotency_key=idempotency_key,
+        from_review_status=from_review_status,
+        to_review_status=task.review_status,
+        completion_cycle=completion_cycle,
+        completion_note_id=completion_note_id,
+    )
+
+
+def _completion_note_content(value: str) -> str:
+    """Bound the display note while the submission keeps the full raw text."""
+
+    if len(value) <= MAX_TASK_NOTE_CONTENT_LENGTH:
+        return value
+    return value[: MAX_TASK_NOTE_CONTENT_LENGTH - 1] + "…"
+
+
+def _actor_name(session: Session, task: Task, actor_open_id: str) -> str:
+    for owner in _task_assignees(task):
+        if owner.open_id == actor_open_id:
+            return owner.name
+    alias = session.scalar(
+        select(ChatMemberAlias.alias).where(
+            ChatMemberAlias.chat_id == task.chat_id,
+            ChatMemberAlias.open_id == actor_open_id,
+        )
+    )
+    if alias:
+        return alias
+    user = session.get(User, actor_open_id)
+    if user is not None and user.name:
+        return user.name
+    return actor_open_id
+
+
+def _lifecycle_idempotency_key(source: str, *parts: object) -> str:
+    payload = "\x1f".join((source, *(str(part) for part in parts)))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"lifecycle:{source}:{digest}"
+
+
 def _validate_replay(
     event: TaskLifecycleEvent,
     candidate: LifecycleCandidate,
@@ -1120,6 +1739,34 @@ def _validate_replay(
     ):
         raise LifecycleMutationError(
             "trigger message was already used for a different lifecycle update"
+        )
+
+
+def _validate_private_review_replay(
+    event: TaskLifecycleEvent,
+    *,
+    candidate: ReviewActionCandidate,
+    actor_open_id: str,
+    evidence: tuple[Message, ...],
+) -> None:
+    """Ensure a duplicate delivery cannot reinterpret a review decision."""
+
+    stored_evidence = tuple(
+        link.message.message_id for link in event.evidence_links
+    )
+    if (
+        event.trigger_source != "message"
+        or event.task_id != candidate.task_id
+        or event.actor_open_id != actor_open_id
+        or event.authorization_role
+        != LifecycleAuthorizationRole.ADMINISTRATOR.value
+        or event.action != candidate.action.value
+        or event.confidence != candidate.confidence
+        or event.reason != candidate.reason
+        or stored_evidence != tuple(item.message_id for item in evidence)
+    ):
+        raise LifecycleMutationError(
+            "trigger message was already used for a different private review action"
         )
 
 
@@ -1170,6 +1817,7 @@ def _validate_management_replay(
     new_title: str | None,
     new_owner_open_ids: tuple[str, ...],
     merge_target_task_id: int | None,
+    reason: str | None,
 ) -> None:
     requested_deadline = (
         None
@@ -1209,6 +1857,7 @@ def _validate_management_replay(
         or event_title != new_title
         or event_owner_open_ids != new_owner_open_ids
         or event_merge_target != merge_target_task_id
+        or event.reason != reason
     ):
         raise LifecycleMutationError(
             "management request was already used for a different lifecycle update"
@@ -1530,6 +2179,20 @@ def _required_text(value: str, field: str, maximum: int) -> str:
     cleaned = value.strip()
     if len(cleaned) > maximum:
         raise LifecycleMutationError(f"{field} is too long")
+    return cleaned
+
+
+def _management_reason(value: str | None) -> str:
+    if not isinstance(value, str):
+        raise LifecycleMutationError("management reopen requires a reason")
+    # Preserve the administrator's original punctuation in the immutable audit
+    # trail. NFC combines equivalent Unicode sequences without the compatibility
+    # folding performed by NFKC (for example, turning `，` into `,`).
+    cleaned = " ".join(unicodedata.normalize("NFC", value).split())
+    if not cleaned or len(cleaned) > 2_000:
+        raise LifecycleMutationError(
+            "management reopen reason must contain 1 to 2000 characters"
+        )
     return cleaned
 
 

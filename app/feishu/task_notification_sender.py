@@ -153,10 +153,11 @@ def format_task_notification_text(
     if lease.kind is TaskNotificationKind.TASK_DONE_ADMIN:
         return "\n".join(
             (
-                "✅ 任务完成通知",
+                "✅ 任务完成待复核",
                 "",
-                f"{lease.owner_name} 已完成任务：",
+                f"{lease.owner_name} 已提交任务完成说明：",
                 task_line,
+                "当前状态：已完成，等待管理员复核。",
             )
         )
     if lease.kind is TaskNotificationKind.TASK_CANCELLED_ADMIN:
@@ -182,10 +183,11 @@ def format_task_notification_text(
     if lease.kind is TaskNotificationKind.TASK_DONE_COASSIGNEE:
         return "\n".join(
             (
-                "✅ 共同任务状态更新",
+                "✅ 共同任务已提交完成",
                 "",
-                f"{lease.owner_name} 已将共同任务标记为完成：",
+                f"{lease.owner_name} 已提交共同任务完成说明：",
                 task_line,
+                "当前状态：已完成，等待管理员复核。",
             )
         )
     if lease.kind is TaskNotificationKind.TASK_CANCELLED_COASSIGNEE:
@@ -301,6 +303,48 @@ def format_task_notification_text(
                 f"当前负责人：{lease.owner_name}",
                 f"当前状态：{_status_text(lease.status_snapshot)}",
                 f"截止时间：{_deadline_text(lease.deadline)}",
+            )
+        )
+    if lease.kind is TaskNotificationKind.TASK_REOPENED_COASSIGNEE:
+        return "\n".join(
+            (
+                "🔁 任务已要求返工",
+                "",
+                f"管理员要求重新完成共同任务：{task_line}",
+                f"当前负责人：{lease.owner_name}",
+                f"返工原因：{lease.reason or '管理员未提供'}",
+                f"当前状态：{_status_text(lease.status_snapshot)}",
+                f"截止时间：{_deadline_text(lease.deadline)}",
+            )
+        )
+    if lease.kind is TaskNotificationKind.TASK_REOPENED_ADMIN:
+        return "\n".join(
+            (
+                "🔁 任务返工通知",
+                "",
+                f"任务已要求返工：{task_line}",
+                f"负责人：{lease.owner_name}",
+                f"返工原因：{lease.reason or '管理员未提供'}",
+                f"当前状态：{_status_text(lease.status_snapshot)}",
+                f"截止时间：{_deadline_text(lease.deadline)}",
+            )
+        )
+    if lease.kind is TaskNotificationKind.TASK_ACCEPTED_COASSIGNEE:
+        return "\n".join(
+            (
+                "✅ 任务验收通过",
+                "",
+                f"管理员已验收通过共同任务：{task_line}",
+                f"验收人：{lease.owner_name}",
+            )
+        )
+    if lease.kind is TaskNotificationKind.TASK_ACCEPTED_ADMIN:
+        return "\n".join(
+            (
+                "✅ 任务验收通过通知",
+                "",
+                f"任务已通过管理员验收：{task_line}",
+                f"负责人：{lease.owner_name}",
             )
         )
     assert lease.kind is TaskNotificationKind.TASK_OVERDUE_ADMIN

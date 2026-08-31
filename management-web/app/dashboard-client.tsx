@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 const API_ORIGIN = process.env.NEXT_PUBLIC_MANAGEMENT_API_URL ?? "";
 const LAST_CHAT_STORAGE_KEY = "lab-task-console:last-chat-id";
@@ -8,7 +8,7 @@ const TASK_PAGE_SIZE = 10;
 
 type Chat = { chat_id: string; chat_name: string | null; administrator_count: number; open_task_count: number };
 type Assignee = { open_id: string; name: string; position: number };
-type Task = { task_id: number; task_code: string; chat_id: string; title: string; description: string; status: string; merged_into_task_id: number | null; merged_into_task_code: string | null; deadline: string | null; confidence: number; creation_source: "model_detection" | "management_page"; assignees: Assignee[]; created_at: string; updated_at: string };
+type Task = { task_id: number; task_code: string; chat_id: string; title: string; description: string; status: string; created_by_open_id: string | null; created_by_name: string | null; created_via: "unknown" | "detected" | "management"; creator_attribution_basis: string; creator_attribution_confidence: number | null; review_status: "none" | "pending" | "accepted" | "rework_required"; reviewed_by_open_id: string | null; reviewed_by_name: string | null; reviewed_at: string | null; completion_cycle: number; last_completed_by_open_id: string | null; last_completed_by_name: string | null; last_completed_at: string | null; merged_into_task_id: number | null; merged_into_task_code: string | null; deadline: string | null; confidence: number; creation_source: "model_detection" | "management_page"; assignees: Assignee[]; created_at: string; updated_at: string };
 type Dashboard = { chat_id: string; chat_name: string | null; member_count: number; administrator_count: number; total_task_count: number; pending_count: number; todo_count: number; overdue_count: number; done_count: number; cancelled_count: number; open_without_deadline_count: number; due_next_7_days_count: number };
 type Member = { open_id: string; name: string; feishu_name: string; task_alias: string | null; is_owner: boolean; is_administrator: boolean; last_synced_at: string };
 type AdministratorEvent = { event_id: number; action: "grant" | "revoke"; source: string; target_open_id: string; target_name: string; actor_open_id: string | null; actor_name: string | null; created_at: string };
@@ -18,15 +18,32 @@ type ChatSettingEvent = { event_id: number; chat_id: string; actor_open_id: stri
 type TaskPage = { total_count: number; total_pages: number; page: number; limit: number; offset: number; tasks: Task[] };
 type TaskDetail = {
   task: Task;
+  responsibility: { publisher_open_id: string | null; publisher_name: string | null; created_via: string; attribution_basis: string; attribution_confidence: number | null; assignees: Assignee[]; latest_completer_open_id: string | null; latest_completer_name: string | null; latest_completed_at: string | null; latest_reviewer_open_id: string | null; latest_reviewer_name: string | null; latest_reviewed_at: string | null };
   evidence: Array<{ message_id: string; sender_name: string | null; content: string | null; created_at: string }>;
-  lifecycle: Array<{ event_id: number; action: string; previous_status: string; new_status: string; actor_open_id: string; applied_at: string }>;
-  deliveries: Array<{ delivery_type: string; kind: string; status: string; scheduled_for: string }>;
+  lifecycle: Array<{ event_id: number; action: string; actor_open_id: string; actor_name: string | null; authorization_role: string; trigger_source: string; source_message_id: string | null; correlation_id: string | null; previous_status: string; new_status: string; from_review_status: string | null; to_review_status: string | null; reason: string | null; completion_cycle: number | null; evidence_message_ids: string[]; applied_at: string }>;
+  notes: Array<{ note_id: number; author_open_id: string; author_name: string; note_type: string; content: string; source_message_id: string | null; completion_cycle: number; created_at: string }>;
+  completion_submissions: Array<{ submission_id: number; cycle: number; submitted_by_open_id: string; submitted_by_name: string; source_message_id: string | null; completion_note_id: number | null; content: string; evidence_message_ids: string[]; submitted_at: string; review_status: string; reviewed_by_open_id: string | null; reviewed_by_name: string | null; reviewed_at: string | null; review_reason: string | null }>;
+  deliveries: Array<{ delivery_id: number; delivery_type: string; kind: string; recipient_open_id: string; source_lifecycle_event_id: number | null; reason: string | null; status: string; scheduled_for: string; sent_at: string | null; cancelled_at: string | null; cancel_reason: string | null; last_error_code: string | null }>;
+  timeline: Array<{ event_type: "created" | "lifecycle" | "note" | "completion_submission" | "delivery"; event_id: string; occurred_at: string; action: string; actor_open_id: string | null; actor_name: string | null; completion_cycle: number | null; content: string | null; reason: string | null; source_message_id: string | null; evidence_message_ids: string[]; previous_status: string | null; new_status: string | null; from_review_status: string | null; to_review_status: string | null; delivery_type: string | null; recipient_open_id: string | null; delivery_status: string | null }>;
 };
-type ManagementStatusAction = "confirm" | "complete" | "cancel" | "invalidate" | "restore" | "merge";
+type TimelineFilter = "all" | "status" | "note" | "completion_submission" | "delivery";
+type ManagementStatusAction = "confirm" | "complete" | "accept" | "reopen" | "cancel" | "invalidate" | "restore" | "merge";
 type ManualTaskInput = { title: string; description: string; deadline: string | null; open_ids: string[]; request_id: string };
 
 const statusCopy: Record<string, string> = { pending: "待确认", todo: "待办", overdue: "已逾期", done: "已完成", cancelled: "已取消", merged: "已合并" };
+const reviewStatusCopy: Record<string, string> = { none: "无需验收", pending: "待管理员验收", accepted: "已验收通过", rework_required: "需返工" };
+const lifecycleActionCopy: Record<string, string> = { create: "创建任务", confirm: "确认任务", complete: "标记完成", submit_completion: "提交完成", accept: "验收通过", reopen: "要求返工", reschedule: "调整截止时间", cancel: "取消任务", rename: "修改标题", reassign: "调整负责人", invalidate: "撤销误识别", restore: "恢复任务", merge: "合并任务", overdue: "标记逾期", progress: "进度说明", blocker: "阻塞说明", completion: "完成说明", delay: "延期说明", general: "补充说明", correction: "纠错说明" };
+const deliveryKindCopy: Record<string, string> = { task_created_assignee: "新任务通知", due_72h: "第一提醒", due_24h: "第二提醒", due_today: "截止当天提醒", overdue: "逾期提醒", missing_deadline_owner: "缺少截止时间提醒", missing_deadline_admin: "缺少截止时间升级", task_done_admin: "完成待复核通知", task_cancelled_admin: "取消通知", task_overdue_admin: "逾期通知", task_rescheduled_admin: "延期通知", task_done_coassignee: "共同负责人完成通知", task_cancelled_coassignee: "共同负责人取消通知", task_rescheduled_coassignee: "共同负责人延期通知", task_reopened_coassignee: "返工通知", task_reopened_admin: "返工审计通知" };
+const deliveryStatusCopy: Record<string, string> = { scheduled: "待发送", leased: "发送中", sent: "已发送", cancelled: "已取消", dead: "发送失败" };
+const systemReasonCopy: Record<string, string> = { created: "任务创建时生成", activated: "任务进入开放状态", task_deadline_changed: "截止时间已调整，旧提醒自动取消", task_deadline_set: "任务已补充截止时间", task_done: "任务已完成", task_cancelled: "任务已取消", task_merged: "任务已合并", task_invalidated: "误识别任务已撤销", task_outside_allowlist: "任务不在当前通知范围", notification_stage_disabled: "该提醒阶段已关闭", recipient_no_longer_authorized: "收件人已不再具备通知权限" };
 const sourceCopy: Record<string, string> = { local_cli: "本地应急操作", management_page: "管理后台", bootstrap: "初始配置", group_owner_init: "群主初始化", group_owner_takeover: "群主接管", membership_sync: "成员同步" };
+const timelineFilterOptions: Array<{ value: TimelineFilter; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "status", label: "状态" },
+  { value: "note", label: "说明" },
+  { value: "completion_submission", label: "完成" },
+  { value: "delivery", label: "通知" },
+];
 
 class UnauthorizedError extends Error {}
 class ApiError extends Error { constructor(public status: number, message: string) { super(message); } }
@@ -62,6 +79,8 @@ export function DashboardClient() {
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [mergeTargets, setMergeTargets] = useState<Task[]>([]);
   const [creating, setCreating] = useState(false);
+  const [taskCreationMembersLoading, setTaskCreationMembersLoading] = useState(false);
+  const [taskCreationMembersError, setTaskCreationMembersError] = useState("");
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [loading, setLoading] = useState(true);
   const [administrationLoading, setAdministrationLoading] = useState(false);
@@ -231,19 +250,38 @@ export function DashboardClient() {
     finally { if (taskDetailAbort.current === controller) taskDetailAbort.current = null; }
   }
 
-  async function openTaskCreation() {
-    const requestedChatId = chatId;
-    if (!requestedChatId) return;
+  async function loadTaskCreationMembers(requestedChatId: string) {
     const token = ++taskCreationRequest.current;
-    setCreating(true);
+    setTaskCreationMembersLoading(true);
+    setTaskCreationMembersError("");
     try {
       const memberItems = await apiRequest<Member[]>(`/api/chats/${requestedChatId}/members`);
       if (token !== taskCreationRequest.current || activeChatId.current !== requestedChatId) return;
       setMembers(memberItems); setError("");
     } catch (reason) {
       if (token !== taskCreationRequest.current || activeChatId.current !== requestedChatId) return;
-      setCreating(false); handleFailure(reason, "当前群成员加载失败，暂时无法新建任务。");
+      if (reason instanceof UnauthorizedError) setUnauthorized(true);
+      else if (reason instanceof ApiError && reason.status === 503) setTaskCreationMembersError("暂时无法向飞书核验最新群成员，请稍后重试。");
+      else setTaskCreationMembersError("群成员加载失败，请检查网络后重试。");
+    } finally {
+      if (token === taskCreationRequest.current && activeChatId.current === requestedChatId) setTaskCreationMembersLoading(false);
     }
+  }
+
+  async function openTaskCreation() {
+    const requestedChatId = chatId;
+    if (!requestedChatId) return;
+    setCreating(true);
+    setMembers([]);
+    setError("");
+    await loadTaskCreationMembers(requestedChatId);
+  }
+
+  function closeTaskCreation() {
+    taskCreationRequest.current += 1;
+    setCreating(false);
+    setTaskCreationMembersLoading(false);
+    setTaskCreationMembersError("");
   }
 
   async function refreshChatSummary(requestedChatId: string) {
@@ -284,8 +322,13 @@ export function DashboardClient() {
     await mutateTask("assignees", { open_ids: openIds, request_id: requestId });
   }
 
-  async function transitionTask(action: ManagementStatusAction, requestId: string, targetTaskId?: number) {
-    await mutateTask("status", targetTaskId ? { action, request_id: requestId, target_task_id: targetTaskId } : { action, request_id: requestId });
+  async function transitionTask(action: ManagementStatusAction, requestId: string, targetTaskId?: number, reason?: string) {
+    const body = targetTaskId
+      ? { action, request_id: requestId, target_task_id: targetTaskId }
+      : reason !== undefined
+        ? { action, request_id: requestId, reason }
+        : { action, request_id: requestId };
+    await mutateTask("status", body);
   }
 
   function applySearch(value: string) {
@@ -328,7 +371,7 @@ export function DashboardClient() {
       body: JSON.stringify(input),
     });
     if (token !== taskCreationRequest.current || activeChatId.current !== requestedChatId) return;
-    setCreating(false); setDetail(created);
+    setCreating(false); setTaskCreationMembersLoading(false); setTaskCreationMembersError(""); setDetail(created);
     setLoading(true);
     setRefreshVersion((version) => version + 1);
     try {
@@ -399,7 +442,7 @@ export function DashboardClient() {
     setLoading(true); setChatId(nextChatId); setPage(1);
     setDashboard(null); setTaskPage(null); setMembers([]);
     setAdministratorEvents([]); setChatSettings(null); setChatSettingEvents([]);
-    setDetail(null); setMergeTargets([]); setCreating(false);
+    setDetail(null); setMergeTargets([]); setCreating(false); setTaskCreationMembersLoading(false); setTaskCreationMembersError("");
     setAdministrationLoading(view === "administrators"); setSettingsLoading(view === "settings"); setSettingsSaving(false); setMutatingOpenId("");
     setAdministrationNotice(""); setSettingsNotice(""); setError("");
     writeTaskViewState({ chatId: nextChatId, page: 1 });
@@ -422,7 +465,7 @@ export function DashboardClient() {
       <header className="topbar"><div><p className="eyebrow">LAB TASK CONSOLE</p><h1>{view === "tasks" ? "任务总览" : view === "administrators" ? "群管理员" : "群设置"}</h1></div><div className="topbar-actions"><span className="live-pill"><i /> 权限连接正常</span><label className="group-switcher"><span className="sr-only">选择群聊</span><select value={chatId} onChange={(event) => changeChat(event.target.value)}>{chats.map((chat) => <option key={chat.chat_id} value={chat.chat_id}>{chat.chat_name ?? "未命名群聊"}</option>)}</select><b>⌄</b></label></div></header>
       {view === "tasks" ? <TaskWorkspace dashboard={dashboard} error={error} filter={filter} loading={loading} page={page} query={query} searchInput={searchInput} selectedChat={selectedChat} setFilter={changeFilter} setSearchInput={setSearchInput} onSearch={applySearch} onClearSearch={clearSearch} onPageChange={changePage} taskPage={taskPage} openTask={openTask} openTaskCreation={openTaskCreation} /> : view === "administrators" ? <AdministratorWorkspace chatName={selectedChat?.chat_name ?? "当前群聊"} error={error} loading={administrationLoading} members={members} events={administratorEvents} mutatingOpenId={mutatingOpenId} notice={administrationNotice} onChange={changeAdministrator} /> : <SettingsWorkspace chatName={selectedChat?.chat_name ?? "当前群聊"} error={error} loading={settingsLoading} saving={settingsSaving} settings={chatSettings} members={members} events={chatSettingEvents} notice={settingsNotice} onSave={saveSettings} />}
     </section>
-    {creating ? <CreateTaskDialog chatName={selectedChat?.chat_name ?? "当前群聊"} members={members} onClose={() => setCreating(false)} onSave={createTask} /> : null}
+    {creating ? <CreateTaskDialog chatName={selectedChat?.chat_name ?? "当前群聊"} members={members} membersLoading={taskCreationMembersLoading} membersError={taskCreationMembersError} onClose={closeTaskCreation} onRetryMembers={() => loadTaskCreationMembers(chatId)} onSave={createTask} /> : null}
     {detail ? <TaskDrawer key={`${detail.task.chat_id}-${detail.task.task_id}`} detail={detail} mergeTargets={mergeTargets} members={members} onClose={() => { taskDetailRequest.current += 1; taskDetailAbort.current?.abort(); taskDetailAbort.current = null; setDetail(null); setMergeTargets([]); }} onRename={renameTask} onReassign={reassignTask} onReschedule={rescheduleTask} onTransition={transitionTask} /> : null}
   </main>;
 }
@@ -581,7 +624,7 @@ function missingDeadlineSummary(settings?: ChatSettingValues) {
 
 function Metric({ label, value, note, tone = "" }: { label: string; value: number; note: string; tone?: string }) { return <article className={`metric-card ${tone}`}><span className="metric-label">{label}</span><strong>{value}</strong><span className={`metric-note ${tone === "danger" ? "" : "calm"}`}>{note}</span></article>; }
 
-function CreateTaskDialog({ chatName, members, onClose, onSave }: { chatName: string; members: Member[]; onClose: () => void; onSave: (input: ManualTaskInput) => Promise<void> }) {
+function CreateTaskDialog({ chatName, members, membersLoading, membersError, onClose, onRetryMembers, onSave }: { chatName: string; members: Member[]; membersLoading: boolean; membersError: string; onClose: () => void; onRetryMembers: () => Promise<void>; onSave: (input: ManualTaskInput) => Promise<void> }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [deadline, setDeadline] = useState("");
@@ -617,17 +660,58 @@ function CreateTaskDialog({ chatName, members, onClose, onSave }: { chatName: st
     } finally { setSaving(false); }
   }
 
-  return <div className="drawer-backdrop"><button className="drawer-dismiss" type="button" onClick={onClose} aria-label="关闭新建任务" /><aside className="task-drawer create-task-drawer" role="dialog" aria-modal="true" aria-label="手动新建任务"><button className="drawer-close" type="button" onClick={onClose} aria-label="关闭">×</button><p className="drawer-code">管理员补建</p><h2>新建任务</h2><p className="drawer-description">为 {chatName} 补建一项漏识别任务。创建后立即进入待办，并私聊每位负责人。</p><form className="create-task-form" onSubmit={submit}><label>任务标题<span>必填，1–200 个字符</span><input maxLength={200} value={title} onChange={(event) => { setTitle(event.target.value); changed(); }} placeholder="例如：完成前端验收报告" /></label><label>任务说明<span>选填，最多 2000 个字符</span><textarea maxLength={2000} rows={4} value={description} onChange={(event) => { setDescription(event.target.value); changed(); }} placeholder="补充交付内容、文件位置或验收要求" /></label><label>截止时间<span>选填，北京时间（UTC+8）</span><input type="datetime-local" value={deadline} onChange={(event) => { setDeadline(event.target.value); changed(); }} /></label><fieldset><legend>负责人<span>至少选择 1 人；选择顺序决定主负责人</span></legend><div className="assignee-options">{members.map((member) => { const checked = selected.includes(member.open_id); const position = selected.indexOf(member.open_id); const disabled = !member.task_alias || (!checked && selected.length >= 20); return <label className={disabled ? "disabled" : ""} key={member.open_id}><input type="checkbox" checked={checked} disabled={disabled || saving} onChange={(event) => toggle(member.open_id, event.target.checked)} /><span><b>{member.task_alias ?? member.feishu_name}</b><small>{member.task_alias ? `飞书名称：${member.feishu_name}` : "尚未绑定任务姓名，不可选择"}</small></span>{position === 0 ? <em>主负责人</em> : position > 0 ? <em>共同负责</em> : null}</label>; })}</div></fieldset>{error ? <p className="editor-error" role="alert">{error}</p> : null}<div className="create-task-submit"><p>系统将生成唯一任务编号、负责人私聊和对应提醒计划。</p><button type="submit" disabled={saving || !normalizedTitle || !selected.length}>{saving ? "创建中…" : "创建并通知负责人"}</button></div></form></aside></div>;
+  return <div className="drawer-backdrop"><button className="drawer-dismiss" type="button" onClick={onClose} aria-label="关闭新建任务" /><aside className="task-drawer create-task-drawer" role="dialog" aria-modal="true" aria-label="手动新建任务"><button className="drawer-close" type="button" onClick={onClose} aria-label="关闭">×</button><p className="drawer-code">管理员补建</p><h2>新建任务</h2><p className="drawer-description">为 {chatName} 补建一项漏识别任务。创建后立即进入待办，并私聊每位负责人。</p><form className="create-task-form" onSubmit={submit}><label>任务标题<span>必填，1–200 个字符</span><input maxLength={200} value={title} onChange={(event) => { setTitle(event.target.value); changed(); }} placeholder="例如：完成前端验收报告" /></label><label>任务说明<span>选填，最多 2000 个字符</span><textarea maxLength={2000} rows={4} value={description} onChange={(event) => { setDescription(event.target.value); changed(); }} placeholder="补充交付内容、文件位置或验收要求" /></label><label>截止时间<span>选填，北京时间（UTC+8）</span><input type="datetime-local" value={deadline} onChange={(event) => { setDeadline(event.target.value); changed(); }} /></label><fieldset><legend>负责人<span>至少选择 1 人；选择顺序决定主负责人</span></legend>{membersLoading ? <div className="member-load-state" role="status" aria-live="polite"><i aria-hidden="true" /><div><b>正在核验群成员</b><p>从飞书同步最新成员与任务姓名…</p></div></div> : membersError ? <div className="member-load-state error" role="alert"><div><b>暂时无法加载负责人</b><p>{membersError} 已填写的任务内容会保留。</p></div><button type="button" onClick={() => void onRetryMembers()}>重新加载群成员</button></div> : <div className="assignee-options">{members.map((member) => { const checked = selected.includes(member.open_id); const position = selected.indexOf(member.open_id); const disabled = !member.task_alias || (!checked && selected.length >= 20); return <label className={disabled ? "disabled" : ""} key={member.open_id}><input type="checkbox" checked={checked} disabled={disabled || saving} onChange={(event) => toggle(member.open_id, event.target.checked)} /><span><b>{member.task_alias ?? member.feishu_name}</b><small>{member.task_alias ? `飞书名称：${member.feishu_name}` : "尚未绑定任务姓名，不可选择"}</small></span>{position === 0 ? <em>主负责人</em> : position > 0 ? <em>共同负责</em> : null}</label>; })}</div>}</fieldset>{error ? <p className="editor-error" role="alert">{error}</p> : null}<div className="create-task-submit"><p>系统将生成唯一任务编号、负责人私聊和对应提醒计划。</p><button type="submit" disabled={saving || membersLoading || Boolean(membersError) || !normalizedTitle || !selected.length}>{saving ? "创建中…" : "创建并通知负责人"}</button></div></form></aside></div>;
 }
 
-function TaskDrawer({ detail, mergeTargets, members, onClose, onRename, onReassign, onReschedule, onTransition }: { detail: TaskDetail; mergeTargets: Task[]; members: Member[]; onClose: () => void; onRename: (title: string, requestId: string) => Promise<void>; onReassign: (openIds: string[], requestId: string) => Promise<void>; onReschedule: (deadline: string, requestId: string) => Promise<void>; onTransition: (action: ManagementStatusAction, requestId: string, targetTaskId?: number) => Promise<void> }) {
+function TaskDrawer({ detail, mergeTargets, members, onClose, onRename, onReassign, onReschedule, onTransition }: { detail: TaskDetail; mergeTargets: Task[]; members: Member[]; onClose: () => void; onRename: (title: string, requestId: string) => Promise<void>; onReassign: (openIds: string[], requestId: string) => Promise<void>; onReschedule: (deadline: string, requestId: string) => Promise<void>; onTransition: (action: ManagementStatusAction, requestId: string, targetTaskId?: number, reason?: string) => Promise<void> }) {
   const [deadlineValue, setDeadlineValue] = useState(formatShanghaiInput(detail.task.deadline));
   const [savingDeadline, setSavingDeadline] = useState(false);
   const [deadlineNotice, setDeadlineNotice] = useState("");
   const [deadlineError, setDeadlineError] = useState("");
   const pendingRequestId = useRef("");
+  const dialogRef = useRef<HTMLElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const onCloseRef = useRef(onClose);
   const actionable = detail.task.status === "todo" || detail.task.status === "overdue";
   const unchanged = deadlineValue === formatShanghaiInput(detail.task.deadline);
+
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeButtonRef.current?.focus();
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex='-1'])"));
+      if (!focusable.length) {
+        event.preventDefault();
+        dialogRef.current.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      previousFocus?.focus();
+    };
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -653,26 +737,119 @@ function TaskDrawer({ detail, mergeTargets, members, onClose, onRename, onReassi
     } finally { setSavingDeadline(false); }
   }
 
-  return <div className="drawer-backdrop"><button className="drawer-dismiss" type="button" onClick={onClose} aria-label="关闭任务详情" /><aside className="task-drawer" role="dialog" aria-modal="true" aria-label="任务详情"><button className="drawer-close" type="button" onClick={onClose} aria-label="关闭">×</button><p className="drawer-code">{detail.task.task_code}</p><h2>{detail.task.title}</h2>{detail.task.description ? <p className="drawer-description">{detail.task.description}</p> : null}<dl className="detail-grid"><div><dt>负责人</dt><dd>{detail.task.assignees.map((item) => item.name).join("、")}</dd></div><div><dt>状态</dt><dd>{statusCopy[detail.task.status] ?? detail.task.status}</dd></div><div><dt>截止时间</dt><dd>{formatDeadline(detail.task.deadline)}</dd></div><div><dt>创建方式</dt><dd>{detail.task.creation_source === "management_page" ? "管理员手动补建" : `模型识别 · ${Math.round(detail.task.confidence * 100)}%`}</dd></div>{detail.task.merged_into_task_code ? <div><dt>保留任务</dt><dd>{detail.task.merged_into_task_code}</dd></div> : null}</dl>{actionable ? <div className="task-editors"><TitleEditor task={detail.task} onSave={onRename} /><AssigneeEditor members={members} task={detail.task} onSave={onReassign} /><form className="deadline-editor" onSubmit={submitDeadline}><div><label htmlFor={`deadline-${detail.task.task_id}`}>修改截止时间</label><small>北京时间（UTC+8）</small></div><input id={`deadline-${detail.task.task_id}`} type="datetime-local" value={deadlineValue} onChange={(event) => { setDeadlineValue(event.target.value); setDeadlineNotice(""); setDeadlineError(""); pendingRequestId.current = ""; }} /><button type="submit" disabled={savingDeadline || !deadlineValue || unchanged}>{savingDeadline ? "保存中…" : "保存新时间"}</button>{deadlineNotice ? <p className="deadline-success" role="status">{deadlineNotice}</p> : null}{deadlineError ? <p className="deadline-error" role="alert">{deadlineError}</p> : null}</form></div> : null}<LifecycleControls task={detail.task} onSave={onTransition} /><MergeEditor task={detail.task} targets={mergeTargets} onSave={onTransition} /><DetailSection title={`证据消息 · ${detail.evidence.length}`} empty={detail.task.creation_source === "management_page" ? "管理员手动补建任务没有模型证据消息。" : "没有保存的证据消息。"}>{detail.evidence.map((item) => <article className="audit-item" key={item.message_id}><b>{item.sender_name ?? "未知成员"}</b><p>{item.content ?? "非文本消息"}</p><small>{formatTime(item.created_at)}</small></article>)}</DetailSection><DetailSection title={`生命周期 · ${detail.lifecycle.length}`} empty="该任务还没有状态变更记录。">{detail.lifecycle.map((item) => <article className="audit-item" key={item.event_id}><b>{item.action}</b><p>{statusCopy[item.previous_status] ?? item.previous_status} → {statusCopy[item.new_status] ?? item.new_status}</p><small>{formatTime(item.applied_at)}</small></article>)}</DetailSection><DetailSection title={`提醒与通知 · ${detail.deliveries.length}`} empty="该任务没有提醒投递记录。">{detail.deliveries.slice(0, 8).map((item, index) => <article className="audit-item compact" key={`${item.delivery_type}-${index}`}><b>{item.kind}</b><p>{item.status}</p><small>{formatTime(item.scheduled_for)}</small></article>)}</DetailSection></aside></div>;
+  const titleId = `task-drawer-title-${detail.task.task_id}`;
+  return <div className="drawer-backdrop"><button className="drawer-dismiss" type="button" tabIndex={-1} aria-hidden="true" onClick={onClose} /><aside ref={dialogRef} className="task-drawer provenance-drawer" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}><button ref={closeButtonRef} className="drawer-close" type="button" onClick={onClose} aria-label="关闭任务详情">×</button><header className="drawer-header"><div><p className="drawer-code">{detail.task.task_code}</p><h2 id={titleId}>{detail.task.title}</h2></div><span className={`status ${taskStatusTone(detail.task.status)}`}>{statusCopy[detail.task.status] ?? detail.task.status}</span></header>{detail.task.description ? <p className="drawer-description">{detail.task.description}</p> : null}<dl className="detail-grid"><div><dt>当前负责人</dt><dd>{detail.task.assignees.map((item) => item.name).join("、")}</dd></div><div><dt>复核状态</dt><dd>{reviewStatusCopy[detail.task.review_status] ?? detail.task.review_status}</dd></div><div><dt>截止时间</dt><dd>{formatDeadline(detail.task.deadline)}</dd></div><div><dt>创建方式</dt><dd>{detail.task.creation_source === "management_page" ? "管理员手动补建" : `模型识别 · ${Math.round(detail.task.confidence * 100)}%`}</dd></div>{detail.task.merged_into_task_code ? <div><dt>保留任务</dt><dd>{detail.task.merged_into_task_code}</dd></div> : null}</dl><ResponsibilityChain detail={detail} />{actionable ? <div className="task-editors"><TitleEditor task={detail.task} onSave={onRename} /><AssigneeEditor members={members} task={detail.task} onSave={onReassign} /><form className="deadline-editor" onSubmit={submitDeadline}><div><label htmlFor={`deadline-${detail.task.task_id}`}>修改截止时间</label><small>北京时间（UTC+8）</small></div><input id={`deadline-${detail.task.task_id}`} type="datetime-local" value={deadlineValue} onChange={(event) => { setDeadlineValue(event.target.value); setDeadlineNotice(""); setDeadlineError(""); pendingRequestId.current = ""; }} /><button type="submit" disabled={savingDeadline || !deadlineValue || unchanged}>{savingDeadline ? "保存中…" : "保存新时间"}</button>{deadlineNotice ? <p className="deadline-success" role="status">{deadlineNotice}</p> : null}{deadlineError ? <p className="deadline-error" role="alert">{deadlineError}</p> : null}</form></div> : null}<LifecycleControls task={detail.task} onSave={onTransition} /><MergeEditor task={detail.task} targets={mergeTargets} onSave={onTransition} /><CompletionHistory detail={detail} /><ProvenanceTimeline detail={detail} /></aside></div>;
 }
 
-function LifecycleControls({ task, onSave }: { task: Task; onSave: (action: ManagementStatusAction, requestId: string) => Promise<void> }) {
+function ResponsibilityChain({ detail }: { detail: TaskDetail }) {
+  const ownerNames = detail.responsibility.assignees.map((item) => item.name).join("、");
+  const reviewerFallback = detail.task.review_status === "pending" ? "等待管理员" : detail.task.review_status === "rework_required" ? "等待重新提交" : "尚未复核";
+  const nodes = [
+    { key: "publisher", marker: "发", label: "发布者", name: detail.responsibility.publisher_name ?? "发布者未知", meta: creationMethodCopy(detail.responsibility.created_via, detail.responsibility.attribution_confidence) },
+    { key: "assignees", marker: "责", label: "负责人", name: ownerNames || "负责人未知", meta: detail.responsibility.assignees.length > 1 ? `${detail.responsibility.assignees.length} 人共同负责` : "当前执行人" },
+    { key: "completer", marker: "完", label: "实际完成人", name: detail.responsibility.latest_completer_name ?? "尚未提交完成", meta: detail.responsibility.latest_completed_at ? formatTime(detail.responsibility.latest_completed_at) : "等待交付" },
+    { key: "reviewer", marker: "核", label: "复核人", name: detail.responsibility.latest_reviewer_name ?? reviewerFallback, meta: detail.responsibility.latest_reviewed_at ? formatTime(detail.responsibility.latest_reviewed_at) : reviewStatusCopy[detail.task.review_status] ?? detail.task.review_status },
+  ];
+  return <section className="provenance-section responsibility-section" aria-labelledby={`responsibility-${detail.task.task_id}`}><div className="provenance-heading"><div><p>RESPONSIBILITY</p><h3 id={`responsibility-${detail.task.task_id}`}>责任链</h3></div><span>历史姓名按当时快照显示</span></div><ol className="responsibility-chain">{nodes.map((node) => <li key={node.key}><i aria-hidden="true">{node.marker}</i><div><small>{node.label}</small><b>{node.name}</b><span>{node.meta}</span></div></li>)}</ol></section>;
+}
+
+function CompletionHistory({ detail }: { detail: TaskDetail }) {
+  return <section className="provenance-section completion-history" aria-labelledby={`completion-history-${detail.task.task_id}`}>
+    <div className="provenance-heading"><div><p>DELIVERIES</p><h3 id={`completion-history-${detail.task.task_id}`}>完成周期 · {detail.completion_submissions.length}</h3></div><span>每次提交永久保留</span></div>
+    {detail.completion_submissions.length ? <div className="completion-cycle-list">{detail.completion_submissions.map((submission) => <article className="completion-cycle-card" key={submission.submission_id}>
+      <header><div><span>第 {submission.cycle} 次提交</span><b>{submission.submitted_by_name}</b></div><em className={`review-badge ${reviewStatusTone(submission.review_status)}`}>{reviewStatusCopy[submission.review_status] ?? submission.review_status}</em></header>
+      <ExpandableText text={submission.content} className="completion-content" />
+      {submission.review_reason ? <blockquote><ExpandableText text={submission.review_reason} label="返工原因" /></blockquote> : null}
+      <footer><time dateTime={submission.submitted_at}>{formatTime(submission.submitted_at)}</time><span>{submission.evidence_message_ids.length} 条来源证据</span>{submission.reviewed_by_name ? <span>复核：{submission.reviewed_by_name}</span> : null}</footer>
+    </article>)}</div> : <p className="provenance-empty">负责人尚未提交完成记录。</p>}
+  </section>;
+}
+
+function ProvenanceTimeline({ detail }: { detail: TaskDetail }) {
+  const [filter, setFilter] = useState<TimelineFilter>("all");
+  const counts = detail.timeline.reduce<Record<TimelineFilter, number>>((result, event) => {
+    result.all += 1;
+    result[event.event_type === "created" || event.event_type === "lifecycle" ? "status" : event.event_type] += 1;
+    return result;
+  }, { all: 0, status: 0, note: 0, completion_submission: 0, delivery: 0 });
+  const visibleEvents = detail.timeline.filter((event) => timelineEventMatchesFilter(event, filter));
+  const activeLabel = timelineFilterOptions.find((option) => option.value === filter)?.label ?? "全部";
+  return <section className="provenance-section timeline-section" aria-labelledby={`provenance-timeline-${detail.task.task_id}`}>
+    <div className="provenance-heading"><div><p>AUDIT TRAIL</p><h3 id={`provenance-timeline-${detail.task.task_id}`}>任务全过程 · {detail.timeline.length}</h3></div><span>按北京时间正序</span></div>
+    {detail.timeline.length ? <>
+      <div className="timeline-filter-bar" role="group" aria-label="按事件类型筛选">
+        {timelineFilterOptions.map((option) => <button key={option.value} className={filter === option.value ? "active" : ""} type="button" aria-pressed={filter === option.value} onClick={() => setFilter(option.value)}><span>{option.label}</span><b aria-hidden="true">{counts[option.value]}</b></button>)}
+      </div>
+      <p className="timeline-filter-summary" aria-live="polite">正在显示{activeLabel}事件 {visibleEvents.length} 条</p>
+      {visibleEvents.length ? <ol className="provenance-timeline">{visibleEvents.map((event) => {
+        const recipient = responsibilityName(detail, event.recipient_open_id);
+        const transition = event.previous_status && event.new_status && event.previous_status !== event.new_status
+          ? `${statusCopy[event.previous_status] ?? event.previous_status} → ${statusCopy[event.new_status] ?? event.new_status}`
+          : event.to_review_status && event.from_review_status !== event.to_review_status
+            ? `${reviewStatusCopy[event.from_review_status ?? ""] ?? event.from_review_status ?? "未复核"} → ${reviewStatusCopy[event.to_review_status] ?? event.to_review_status}`
+            : null;
+        return <li className={`timeline-event ${event.event_type}`} key={event.event_id}><i className="timeline-node" aria-hidden="true" /><article>
+          <header><div><span>{timelineCategoryCopy(event.event_type)}</span><b>{timelineActionCopy(event)}</b></div><time dateTime={event.occurred_at}>{formatTime(event.occurred_at)}</time></header>
+          <p className="timeline-actor">{event.actor_name ?? (event.event_type === "delivery" ? "系统投递" : "系统")} {event.completion_cycle ? `· 第 ${event.completion_cycle} 周期` : ""}</p>
+          {transition ? <p className="timeline-transition">{transition}</p> : null}
+          {event.event_type !== "created" && event.content ? <ExpandableText text={event.content} className="timeline-content" /> : null}
+          {event.reason ? <div className="timeline-reason"><ExpandableText text={readableReason(event.reason)} label="原因" /></div> : null}
+          <footer>{event.delivery_status ? <span>{deliveryStatusCopy[event.delivery_status] ?? event.delivery_status}</span> : null}{recipient ? <span>收件人：{recipient}</span> : null}{event.source_message_id ? <span title={event.source_message_id}>来源消息 {compactIdentifier(event.source_message_id)}</span> : null}{event.evidence_message_ids.length ? <span>{event.evidence_message_ids.length} 条证据</span> : null}</footer>
+        </article></li>;
+      })}</ol> : <p className="provenance-empty timeline-filter-empty">当前任务没有“{activeLabel}”类型的事件。</p>}
+    </> : <p className="provenance-empty">该任务还没有可展示的溯源事件。</p>}
+  </section>;
+}
+
+function ExpandableText({ text, className = "", label }: { text: string; className?: string; label?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const [collapsible, setCollapsible] = useState(false);
+  const contentId = useId();
+  const contentRef = useRef<HTMLParagraphElement | null>(null);
+  useEffect(() => {
+    if (expanded) return;
+    const content = contentRef.current;
+    if (!content) return;
+    const update = () => {
+      const next = content.scrollHeight > content.clientHeight + 1;
+      setCollapsible((current) => current === next ? current : next);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [expanded, text]);
+  return <div className={`expandable-copy ${className} ${!expanded ? "is-collapsed" : ""}`.trim()}>
+    {label ? <b>{label}</b> : null}
+    <p ref={contentRef} id={contentId}>{text}</p>
+    {collapsible ? <button className="expandable-toggle" type="button" aria-controls={contentId} aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? "收起全文" : "展开全文"}</button> : null}
+  </div>;
+}
+
+function LifecycleControls({ task, onSave }: { task: Task; onSave: (action: ManagementStatusAction, requestId: string, targetTaskId?: number, reason?: string) => Promise<void> }) {
   const [saving, setSaving] = useState<ManagementStatusAction | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [showReopenForm, setShowReopenForm] = useState(false);
+  const [reopenReason, setReopenReason] = useState("");
   const requestIds = useRef<Partial<Record<ManagementStatusAction, string>>>({});
   const actionable = task.status === "todo" || task.status === "overdue";
-  const reviewable = task.status === "pending";
-  const restoreable = task.status === "done" || task.status === "cancelled";
+  const detectionReviewable = task.status === "pending";
+  const completionReviewable = task.status === "done" && task.review_status === "pending";
+  const completionAccepted = task.status === "done" && task.review_status === "accepted";
+  const reopenable = task.status === "done" && (task.review_status === "pending" || task.review_status === "accepted");
+  const restoreable = task.status === "cancelled";
 
   async function apply(action: ManagementStatusAction) {
     const copy = {
       confirm: { question: `确认 ${task.task_code} 是真实任务并进入待办？确认后会私聊负责人。`, success: "任务已确认，负责人通知与提醒计划已生成。" },
       complete: { question: `确认将 ${task.task_code} 标记为已完成？`, success: "任务已完成，未发送提醒已取消。" },
+      accept: { question: `确认 ${task.task_code} 的第 ${task.completion_cycle} 次完成提交已达到要求？验收结果会永久写入任务溯源。`, success: "验收已通过，复核人和验收时间已保存。" },
       cancel: { question: `确认取消 ${task.task_code}？该操作会取消所有未发送提醒。`, success: "任务已取消，未发送提醒已取消。" },
       invalidate: { question: `确认将 ${task.task_code} 标记为误识别并撤销？`, success: "误识别任务已撤销，并保留审计记录。" },
       restore: { question: `确认恢复 ${task.task_code}？原完成或取消记录会保留，并按当前截止时间重新生成提醒。`, success: "任务已恢复，提醒计划已重建。" },
       merge: { question: "", success: "任务已合并。" },
+      reopen: { question: "", success: "任务已要求返工。" },
     }[action];
     if (!window.confirm(copy.question)) return;
     setSaving(action); setNotice(""); setError("");
@@ -684,8 +861,43 @@ function LifecycleControls({ task, onSave }: { task: Task; onSave: (action: Mana
     finally { setSaving(null); }
   }
 
-  if (!actionable && !reviewable && !restoreable && !notice && !error) return null;
-  return <section className={`lifecycle-controls ${reviewable ? "review" : ""}`} aria-label={reviewable ? "待确认任务审核" : "任务生命周期操作"}><div><h3>{reviewable ? "审核识别结果" : restoreable ? "终态任务恢复" : "任务状态"}</h3><p>{reviewable ? "该结果置信度较低，确认前不会提醒负责人或生成截止提醒。" : restoreable ? "恢复会保留原完成或取消审计，并按当前截止时间重建提醒。" : "状态操作会写入审计，并同步取消未发送提醒。"}</p></div>{reviewable ? <div className="lifecycle-actions review-actions"><button className="confirm" type="button" disabled={saving !== null} onClick={() => apply("confirm")}>{saving === "confirm" ? "确认中…" : "确认是真实任务"}</button><button className="invalidate" type="button" disabled={saving !== null} onClick={() => apply("invalidate")}>{saving === "invalidate" ? "处理中…" : "不是任务，撤销"}</button></div> : null}{actionable ? <div className="lifecycle-actions"><button className="complete" type="button" disabled={saving !== null} onClick={() => apply("complete")}>{saving === "complete" ? "处理中…" : "标记完成"}</button><button className="cancel" type="button" disabled={saving !== null} onClick={() => apply("cancel")}>{saving === "cancel" ? "处理中…" : "取消任务"}</button><button className="invalidate" type="button" disabled={saving !== null} onClick={() => apply("invalidate")}>{saving === "invalidate" ? "处理中…" : "撤销误识别"}</button></div> : null}{restoreable ? <div className="lifecycle-actions restore-actions"><button className="restore" type="button" disabled={saving !== null} onClick={() => apply("restore")}>{saving === "restore" ? "恢复中…" : "恢复为开放任务"}</button></div> : null}{notice ? <p className="editor-success" role="status">{notice}</p> : null}{error ? <p className="editor-error" role="alert">{error}</p> : null}</section>;
+  async function submitReopen(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const reason = reopenReason.trim().replace(/\s+/g, " ");
+    if (!reason || reason.length > 2000) {
+      setError("请填写 1–2000 个字符的返工原因。");
+      return;
+    }
+    if (!window.confirm(`确认要求 ${task.task_code} 返工并重新进入待办？返工原因会通知负责人并永久写入任务溯源。`)) return;
+    setSaving("reopen"); setNotice(""); setError("");
+    if (!requestIds.current.reopen) requestIds.current.reopen = window.crypto.randomUUID();
+    try {
+      await onSave("reopen", requestIds.current.reopen, undefined, reason);
+      requestIds.current.reopen = "";
+      setReopenReason("");
+      setShowReopenForm(false);
+      setNotice("已要求返工，任务重新进入待办，负责人已收到通知。");
+    } catch (reasonCaught) {
+      setError(taskMutationError(reasonCaught));
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  if (!actionable && !detectionReviewable && !completionReviewable && !completionAccepted && !reopenable && !restoreable && !notice && !error) return null;
+  const heading = detectionReviewable ? "审核识别结果" : completionReviewable ? "复核完成提交" : completionAccepted ? "任务已验收" : restoreable ? "已取消任务恢复" : "任务状态";
+  const description = detectionReviewable
+    ? "该结果置信度较低，确认前不会提醒负责人或生成截止提醒。"
+    : completionReviewable
+      ? `${task.last_completed_by_name ?? "负责人"} 已提交第 ${task.completion_cycle} 次完成，管理员验收后才会成为正式通过记录。`
+      : completionAccepted
+        ? `${task.reviewed_by_name ?? "本群管理员"} 已于 ${task.reviewed_at ? formatTime(task.reviewed_at) : "本次复核"}确认通过。`
+        : restoreable
+          ? "恢复会保留原取消审计，并按当前截止时间重建提醒。"
+          : "状态操作会写入审计，并同步取消未发送提醒。";
+  const reviewClass = detectionReviewable ? "review" : completionReviewable ? "completion-review" : completionAccepted ? "completion-accepted" : "";
+
+  return <section className={`lifecycle-controls ${reviewClass}`} aria-label={completionReviewable || completionAccepted ? "任务完成验收" : detectionReviewable ? "待确认任务审核" : "任务生命周期操作"} aria-busy={saving !== null}><div><h3>{heading}</h3><p>{description}</p>{task.status === "done" ? <small className="review-state">{reviewStatusCopy[task.review_status] ?? task.review_status}</small> : null}</div>{detectionReviewable ? <div className="lifecycle-actions review-actions"><button className="confirm" type="button" disabled={saving !== null} onClick={() => apply("confirm")}>{saving === "confirm" ? "确认中…" : "确认是真实任务"}</button><button className="invalidate" type="button" disabled={saving !== null} onClick={() => apply("invalidate")}>{saving === "invalidate" ? "处理中…" : "不是任务，撤销"}</button></div> : null}{completionReviewable ? <div className="lifecycle-actions accept-actions"><button className="accept" type="button" disabled={saving !== null} onClick={() => apply("accept")}>{saving === "accept" ? "验收中…" : "验收通过"}</button></div> : null}{reopenable ? <div className="reopen-control"><div className="reopen-control-heading"><div><b>完成质量不符合要求？</b><small>要求返工会保留本次完成与验收记录，并重新生成截止提醒。</small></div>{!showReopenForm ? <button className="reopen-trigger" type="button" disabled={saving !== null} onClick={() => { setShowReopenForm(true); setNotice(""); setError(""); }}>要求返工</button> : null}</div>{showReopenForm ? <form className="reopen-editor" onSubmit={submitReopen}><label htmlFor={`reopen-reason-${task.task_id}`}>返工原因<span>必填，将写入任务溯源并私聊负责人</span></label><textarea id={`reopen-reason-${task.task_id}`} rows={4} maxLength={2000} value={reopenReason} onChange={(event) => { setReopenReason(event.target.value); requestIds.current.reopen = ""; setError(""); setNotice(""); }} placeholder="例如：当前交付缺少实验日志，请补齐结果文件与日志路径后重新提交。" /><div className="reopen-editor-actions"><button className="secondary" type="button" disabled={saving !== null} onClick={() => { setShowReopenForm(false); setReopenReason(""); setError(""); requestIds.current.reopen = ""; }}>暂不返工</button><button className="reopen-submit" type="submit" disabled={saving !== null || !reopenReason.trim()}>{saving === "reopen" ? "正在重新开启…" : "要求返工并重新开启"}</button></div></form> : null}</div> : null}{actionable ? <div className="lifecycle-actions"><button className="complete" type="button" disabled={saving !== null} onClick={() => apply("complete")}>{saving === "complete" ? "处理中…" : "标记完成"}</button><button className="cancel" type="button" disabled={saving !== null} onClick={() => apply("cancel")}>{saving === "cancel" ? "处理中…" : "取消任务"}</button><button className="invalidate" type="button" disabled={saving !== null} onClick={() => apply("invalidate")}>{saving === "invalidate" ? "处理中…" : "撤销误识别"}</button></div> : null}{restoreable ? <div className="lifecycle-actions restore-actions"><button className="restore" type="button" disabled={saving !== null} onClick={() => apply("restore")}>{saving === "restore" ? "恢复中…" : "恢复为开放任务"}</button></div> : null}{notice ? <p className="editor-success" role="status">{notice}</p> : null}{error ? <p className="editor-error" role="alert">{error}</p> : null}</section>;
 }
 
 function MergeEditor({ task, targets, onSave }: { task: Task; targets: Task[]; onSave: (action: ManagementStatusAction, requestId: string, targetTaskId?: number) => Promise<void> }) {
@@ -858,7 +1070,46 @@ function taskMutationError(reason: unknown) {
   return "修改失败，请稍后重试。";
 }
 function taskStatusTone(status: string) { return status === "overdue" ? "red" : status === "done" ? "green" : status === "pending" ? "amber" : "blue"; }
-function DetailSection({ title, empty, children }: { title: string; empty: string; children: React.ReactNode }) { const count = Array.isArray(children) ? children.length : children ? 1 : 0; return <section className="detail-section"><h3>{title}</h3>{count ? children : <p className="empty-copy">{empty}</p>}</section>; }
+function creationMethodCopy(via: string, confidence: number | null) {
+  if (via === "management") return "管理后台创建";
+  if (via === "detected") return confidence === null ? "模型识别" : `模型识别 · 归因 ${Math.round(confidence * 100)}%`;
+  return "历史来源未知";
+}
+function reviewStatusTone(status: string) {
+  if (status === "accepted") return "green";
+  if (status === "pending") return "amber";
+  if (status === "rework_required") return "red";
+  return "neutral";
+}
+function responsibilityName(detail: TaskDetail, openId: string | null) {
+  if (!openId) return "";
+  const people = [
+    { open_id: detail.responsibility.publisher_open_id, name: detail.responsibility.publisher_name },
+    ...detail.responsibility.assignees.map((item) => ({ open_id: item.open_id, name: item.name })),
+    { open_id: detail.responsibility.latest_completer_open_id, name: detail.responsibility.latest_completer_name },
+    { open_id: detail.responsibility.latest_reviewer_open_id, name: detail.responsibility.latest_reviewer_name },
+  ];
+  return people.find((person) => person.open_id === openId)?.name ?? `成员 ${compactIdentifier(openId)}`;
+}
+function timelineCategoryCopy(type: TaskDetail["timeline"][number]["event_type"]) {
+  return { created: "任务创建", lifecycle: "状态变更", note: "任务说明", completion_submission: "完成提交", delivery: "提醒与通知" }[type];
+}
+function timelineEventMatchesFilter(event: TaskDetail["timeline"][number], filter: TimelineFilter) {
+  if (filter === "all") return true;
+  if (filter === "status") return event.event_type === "created" || event.event_type === "lifecycle";
+  return event.event_type === filter;
+}
+function timelineActionCopy(event: TaskDetail["timeline"][number]) {
+  if (event.event_type === "delivery") return deliveryKindCopy[event.action] ?? event.action;
+  return lifecycleActionCopy[event.action] ?? event.action;
+}
+function readableReason(reason: string) {
+  if (systemReasonCopy[reason]) return systemReasonCopy[reason];
+  if (reason.startsWith("superseded_by_")) return "已有更优先的提醒计划，此条自动取消";
+  if (reason.startsWith("task_")) return "任务状态已变化，此条自动取消";
+  return reason;
+}
+function compactIdentifier(value: string) { return value.length <= 12 ? value : `…${value.slice(-8)}`; }
 function SignedOut() { return <main className="signed-out"><section><div className="brand-mark">LT</div><p className="eyebrow">LAB TASK CONSOLE</p><h1>请从飞书进入管理后台</h1><p>私聊机器人发送“管理后台”，打开 5 分钟内有效的一次性链接。</p><span>页面不会接受手动填写的 Open ID。</span></section></main>; }
 function formatDeadline(value: string | null) { return value ? formatTime(value) : "未设置"; }
 function formatTime(value: string) { return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value)); }

@@ -191,10 +191,13 @@ class DevelopmentServiceStack:
         self._sleep = sleeper
         self.shutdown_timeout = shutdown_timeout
         self.running: list[RunningService] = []
+        self._shutdown_requested = False
+        self._shutdown_signal: int | None = None
 
     def run(self) -> int:
         """Block until interrupted or until any required child exits."""
 
+        previous_handlers = self._install_shutdown_signal_handlers()
         try:
             self._start_all()
             print(
@@ -202,7 +205,7 @@ class DevelopmentServiceStack:
                 "Press Ctrl+C once to stop all of them.",
                 flush=True,
             )
-            while True:
+            while not self._shutdown_requested:
                 for service in self.running:
                     return_code = service.process.poll()
                     if return_code is not None:
@@ -214,6 +217,8 @@ class DevelopmentServiceStack:
                         )
                         return return_code if return_code != 0 else 1
                 self._sleep(0.25)
+            print("\nStopping all development services...", flush=True)
+            return 0
         except KeyboardInterrupt:
             print("\nStopping all development services...", flush=True)
             return 0
@@ -223,6 +228,47 @@ class DevelopmentServiceStack:
             ) from exc
         finally:
             self._stop_all()
+            self._restore_shutdown_signal_handlers(previous_handlers)
+
+    def _install_shutdown_signal_handlers(
+        self,
+    ) -> tuple[tuple[int, signal.Handlers], ...]:
+        """Turn process termination into the same supervised cleanup path.
+
+        Each child starts in its own process group so a force-terminated
+        supervisor would otherwise leave listeners and workers orphaned. The
+        handlers only set a flag; the main polling loop performs all cleanup.
+        """
+
+        installed: list[tuple[int, signal.Handlers]] = []
+        for name in ("SIGTERM", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, self._request_shutdown)
+            except (OSError, ValueError):
+                # ``signal.signal`` is restricted to the main interpreter
+                # thread. Tests or embedded callers may legitimately run the
+                # supervisor elsewhere, where KeyboardInterrupt still works.
+                continue
+            installed.append((signum, previous))
+        return tuple(installed)
+
+    @staticmethod
+    def _restore_shutdown_signal_handlers(
+        handlers: tuple[tuple[int, signal.Handlers], ...],
+    ) -> None:
+        for signum, previous in handlers:
+            try:
+                signal.signal(signum, previous)
+            except (OSError, ValueError):
+                continue
+
+    def _request_shutdown(self, signum: int, _frame: object) -> None:
+        self._shutdown_requested = True
+        self._shutdown_signal = signum
 
     def _start_all(self) -> None:
         child_environment = os.environ.copy()

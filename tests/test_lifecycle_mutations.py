@@ -23,15 +23,18 @@ from app.database.models import (
     Message,
     Task,
     TaskAssignee,
+    TaskCompletionSubmission,
     TaskEvidence,
     TaskLifecycleEvent,
     TaskLifecycleEvidence,
+    TaskNote,
     TaskNotification,
     TaskReminder,
     User,
 )
 from app.agent.contracts import TaskOwner
 from app.lifecycle.contracts import LifecycleAction, LifecycleCandidate
+from app.lifecycle.review_contracts import ReviewAction, ReviewActionCandidate
 from app.lifecycle.mutations import (
     LifecycleAuthorizationRole,
     LifecycleModelAudit,
@@ -97,9 +100,33 @@ class LifecycleMutationTest(unittest.TestCase):
         with session_scope(self.session_factory) as session:
             task = session.get(Task, 1)
             event = session.get(TaskLifecycleEvent, result.event_id)
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 1,
+                    TaskCompletionSubmission.cycle == 1,
+                )
+            )
+            completion_note = session.scalar(
+                select(TaskNote).where(
+                    TaskNote.task_id == 1,
+                    TaskNote.note_type == "completion",
+                )
+            )
             self.assertEqual(task.status, "done")
             self.assertEqual(task.completed_at, self.applied_at)
+            self.assertEqual(task.review_status, "pending")
+            self.assertEqual(task.completion_cycle, 1)
+            self.assertEqual(task.last_completed_by_open_id, "ou_owner")
+            self.assertEqual(task.last_completed_by_name, "王政")
+            self.assertEqual(task.last_completed_at, self.applied_at)
             self.assertEqual(event.task_code_snapshot, "T-1A")
+            self.assertEqual(event.actor_name_snapshot, "王政")
+            self.assertEqual(event.source_message_id, "om_owner_done")
+            self.assertEqual(event.correlation_id, "req_done")
+            self.assertIsNotNone(event.idempotency_key)
+            self.assertEqual(event.from_review_status, "none")
+            self.assertEqual(event.to_review_status, "pending")
+            self.assertEqual(event.completion_cycle, 1)
             self.assertEqual(event.model, "qwen-test")
             self.assertEqual(event.model_request_id, "req_done")
             self.assertEqual(event.total_tokens, 120)
@@ -107,6 +134,36 @@ class LifecycleMutationTest(unittest.TestCase):
                 [link.message.message_id for link in event.evidence_links],
                 ["om_context", "om_owner_done"],
             )
+            self.assertIsNotNone(submission)
+            assert submission is not None
+            self.assertEqual(submission.submitted_by_open_id, "ou_owner")
+            self.assertEqual(submission.submitted_by_name_snapshot, "王政")
+            self.assertEqual(submission.source_message_id, "om_owner_done")
+            self.assertEqual(submission.content_snapshot, "om_owner_done")
+            self.assertEqual(
+                submission.evidence_json,
+                '["om_context","om_owner_done"]',
+            )
+            self.assertEqual(submission.submitted_at, self.applied_at)
+            self.assertEqual(submission.review_status, "pending")
+            self.assertEqual(submission.idempotency_key, event.idempotency_key)
+            self.assertIsNotNone(completion_note)
+            assert completion_note is not None
+            self.assertEqual(
+                submission.completion_note_id,
+                completion_note.id,
+            )
+            self.assertEqual(completion_note.author_open_id, "ou_owner")
+            self.assertEqual(completion_note.author_name_snapshot, "王政")
+            self.assertEqual(completion_note.note_type, "completion")
+            self.assertEqual(completion_note.content, "om_owner_done")
+            self.assertEqual(completion_note.source_message_id, "om_owner_done")
+            self.assertEqual(completion_note.source_chat_id, "oc_dm")
+            self.assertEqual(completion_note.completion_cycle, 1)
+            self.assertEqual(completion_note.confidence, 0.98)
+            self.assertEqual(completion_note.model, "qwen-test")
+            self.assertEqual(completion_note.model_request_id, "req_done")
+            self.assertEqual(completion_note.total_tokens, 120)
             statuses = set(
                 session.scalars(
                     select(TaskReminder.status).where(
@@ -137,8 +194,16 @@ class LifecycleMutationTest(unittest.TestCase):
         self.assertEqual(result.reminders_cancelled, 1)
         with session_scope(self.session_factory) as session:
             task = session.get(Task, 2)
+            event = session.get(TaskLifecycleEvent, result.event_id)
             self.assertEqual(task.deadline, new_deadline)
             self.assertEqual(task.status, "todo")
+            self.assertEqual(event.actor_name_snapshot, "王政")
+            self.assertEqual(event.source_message_id, "om_owner_reschedule")
+            self.assertEqual(event.correlation_id, "evt_3")
+            self.assertTrue(event.idempotency_key.startswith("lifecycle:message:"))
+            self.assertEqual(event.from_review_status, "none")
+            self.assertEqual(event.to_review_status, "none")
+            self.assertEqual(event.completion_cycle, 0)
             active = session.scalar(
                 select(func.count(TaskReminder.id)).where(
                     TaskReminder.task_id == 2,
@@ -146,6 +211,230 @@ class LifecycleMutationTest(unittest.TestCase):
                 )
             )
             self.assertEqual(active, 4)
+
+    def test_administrator_accepts_current_completion_atomically_and_idempotently(
+        self,
+    ) -> None:
+        owner_service = self._service()
+        admin_service = self._service(admins={"ou_admin"})
+        owner_service.apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at,
+        )
+
+        accepted_at = self.applied_at + timedelta(minutes=1)
+        accepted = admin_service.apply_management_action(
+            LifecycleAction.ACCEPT,
+            actor_open_id="ou_admin",
+            request_id="management-accept-cycle-one",
+            chat_id="oc_lab",
+            task_id=1,
+            applied_at=accepted_at,
+        )
+        replay = admin_service.apply_management_action(
+            LifecycleAction.ACCEPT,
+            actor_open_id="ou_admin",
+            request_id="management-accept-cycle-one",
+            chat_id="oc_lab",
+            task_id=1,
+            applied_at=accepted_at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(accepted.previous_status, TaskStatus.DONE)
+        self.assertEqual(accepted.new_status, TaskStatus.DONE)
+        self.assertTrue(replay.already_applied)
+        self.assertEqual(replay.event_id, accepted.event_id)
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, 1)
+            event = session.get(TaskLifecycleEvent, accepted.event_id)
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 1,
+                    TaskCompletionSubmission.cycle == 1,
+                )
+            )
+        assert task is not None
+        assert event is not None
+        assert submission is not None
+        self.assertEqual(task.status, "done")
+        self.assertEqual(task.review_status, "accepted")
+        self.assertEqual(task.reviewed_by_open_id, "ou_admin")
+        self.assertEqual(task.reviewed_by_name, "导师")
+        self.assertEqual(task.reviewed_at, accepted_at)
+        self.assertEqual(task.completion_cycle, 1)
+        self.assertEqual(submission.review_status, "accepted")
+        self.assertEqual(submission.reviewed_by_open_id, "ou_admin")
+        self.assertEqual(submission.reviewed_at, accepted_at)
+        self.assertIsNone(submission.review_reason)
+        self.assertEqual(event.action, "accept")
+        self.assertEqual(event.previous_status, "done")
+        self.assertEqual(event.new_status, "done")
+        self.assertEqual(event.from_review_status, "pending")
+        self.assertEqual(event.to_review_status, "accepted")
+        self.assertEqual(event.completion_cycle, 1)
+        self.assertEqual(event.actor_open_id, "ou_admin")
+        self.assertEqual(event.actor_name_snapshot, "导师")
+
+        with self.assertRaisesRegex(LifecycleMutationError, "awaiting review"):
+            admin_service.apply_management_action(
+                LifecycleAction.ACCEPT,
+                actor_open_id="ou_admin",
+                request_id="management-accept-cycle-one-again",
+                chat_id="oc_lab",
+                task_id=1,
+                applied_at=accepted_at + timedelta(minutes=1),
+            )
+        with self.assertRaisesRegex(LifecycleMutationError, "administrator"):
+            self._service().apply_management_action(
+                LifecycleAction.ACCEPT,
+                actor_open_id="ou_owner",
+                request_id="management-owner-cannot-accept",
+                chat_id="oc_lab",
+                task_id=1,
+                applied_at=accepted_at + timedelta(minutes=2),
+            )
+
+    def test_private_review_accept_is_p2p_audited_and_idempotent(self) -> None:
+        owner_service = self._service()
+        admin_service = self._service(admins={"ou_admin"})
+        owner_service.apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at,
+        )
+        review = ReviewActionCandidate(
+            action=ReviewAction.ACCEPT,
+            confidence=0.98,
+            task_id=1,
+            reason=None,
+            evidence_message_ids=("om_admin_rename",),
+        )
+        accepted_at = self.applied_at + timedelta(minutes=1)
+        accepted = admin_service.apply_private_review_action(
+            review,
+            actor_open_id="ou_admin",
+            trigger_message_id="om_admin_rename",
+            task_code="T-1A",
+            applied_at=accepted_at,
+            model_audit=LifecycleModelAudit(
+                provider="openai_compatible",
+                model="qwen-review",
+                response_format="json_schema",
+                request_id="req-review-accept",
+                total_tokens=42,
+            ),
+        )
+        replay = admin_service.apply_private_review_action(
+            review,
+            actor_open_id="ou_admin",
+            trigger_message_id="om_admin_rename",
+            task_code="T-1A",
+            applied_at=accepted_at + timedelta(seconds=1),
+        )
+
+        self.assertFalse(accepted.already_applied)
+        self.assertTrue(replay.already_applied)
+        self.assertEqual(replay.event_id, accepted.event_id)
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, 1)
+            event = session.get(TaskLifecycleEvent, accepted.event_id)
+        assert task is not None
+        assert event is not None
+        self.assertEqual(task.review_status, "accepted")
+        self.assertEqual(task.reviewed_by_open_id, "ou_admin")
+        self.assertEqual(event.trigger_source, "message")
+        self.assertEqual(event.trigger_message_db_id, 9)
+        self.assertEqual(event.source_message_id, "om_admin_rename")
+        self.assertEqual(event.action, "accept")
+        self.assertEqual(event.authorization_role, "administrator")
+        self.assertEqual(event.model, "qwen-review")
+        self.assertEqual(event.model_request_id, "req-review-accept")
+
+    def test_private_review_reopen_requires_reason_and_records_p2p_note(self) -> None:
+        owner_service = self._service()
+        admin_service = self._service(admins={"ou_admin"})
+        owner_service.apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at,
+        )
+        reason = "缺少失败场景和回滚步骤"
+        reopened = admin_service.apply_private_review_action(
+            ReviewActionCandidate(
+                action=ReviewAction.REOPEN,
+                confidence=0.98,
+                task_id=1,
+                reason=reason,
+                evidence_message_ids=("om_admin_rename",),
+            ),
+            actor_open_id="ou_admin",
+            trigger_message_id="om_admin_rename",
+            task_code="1A",
+            applied_at=self.applied_at + timedelta(minutes=1),
+        )
+
+        self.assertEqual(reopened.action.value, "reopen")
+        self.assertEqual(reopened.new_status, TaskStatus.TODO)
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, 1)
+            event = session.get(TaskLifecycleEvent, reopened.event_id)
+            note = session.scalar(
+                select(TaskNote).where(
+                    TaskNote.task_id == 1,
+                    TaskNote.note_type == "reopen",
+                )
+            )
+        assert task is not None
+        assert event is not None
+        assert note is not None
+        self.assertEqual(task.review_status, "rework_required")
+        self.assertEqual(task.status, "todo")
+        self.assertEqual(event.reason, reason)
+        self.assertEqual(event.from_review_status, "pending")
+        self.assertEqual(event.to_review_status, "rework_required")
+        self.assertEqual(note.content, reason)
+        self.assertEqual(note.source_message_id, "om_admin_rename")
+        self.assertEqual(note.source_chat_id, "oc_dm")
+
+    def test_private_review_rejects_non_admin_and_group_trigger(self) -> None:
+        self._service().apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at,
+        )
+        review = ReviewActionCandidate(
+            action=ReviewAction.ACCEPT,
+            confidence=0.98,
+            task_id=1,
+            reason=None,
+            evidence_message_ids=("om_admin_rename",),
+        )
+        with self.assertRaisesRegex(LifecycleMutationError, "administrator"):
+            self._service().apply_private_review_action(
+                review,
+                actor_open_id="ou_owner",
+                trigger_message_id="om_admin_rename",
+                applied_at=self.applied_at + timedelta(minutes=1),
+            )
+        with self.assertRaisesRegex(LifecycleMutationError, "P2P"):
+            group_review = ReviewActionCandidate(
+                action=ReviewAction.ACCEPT,
+                confidence=0.98,
+                task_id=1,
+                reason=None,
+                evidence_message_ids=("om_admin_group",),
+            )
+            self._service(admins={"ou_admin"}).apply_private_review_action(
+                group_review,
+                actor_open_id="ou_admin",
+                trigger_message_id="om_admin_group",
+                applied_at=self.applied_at + timedelta(minutes=1),
+            )
 
     def test_management_reschedule_is_admin_scoped_audited_and_idempotent(
         self,
@@ -188,6 +477,15 @@ class LifecycleMutationTest(unittest.TestCase):
                 event.trigger_management_request_id,
                 "management-request-1",
             )
+            self.assertEqual(event.actor_name_snapshot, "导师")
+            self.assertIsNone(event.source_message_id)
+            self.assertEqual(event.correlation_id, "management-request-1")
+            self.assertTrue(
+                event.idempotency_key.startswith("lifecycle:management_page:")
+            )
+            self.assertEqual(event.from_review_status, "none")
+            self.assertEqual(event.to_review_status, "none")
+            self.assertEqual(event.completion_cycle, 0)
             self.assertIsNone(event.trigger_message_db_id)
             self.assertIsNone(event.trigger_card_action_id)
 
@@ -221,6 +519,186 @@ class LifecycleMutationTest(unittest.TestCase):
                 new_deadline=new_deadline + timedelta(days=3),
                 applied_at=self.applied_at + timedelta(seconds=4),
             )
+
+    def test_administrator_reopens_completion_with_reason_and_preserves_cycle(
+        self,
+    ) -> None:
+        owner_service = self._service()
+        admin_service = self._service(admins={"ou_admin"})
+        owner_service.apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at,
+        )
+        admin_service.apply_management_action(
+            LifecycleAction.ACCEPT,
+            actor_open_id="ou_admin",
+            request_id="management-accept-before-reopen",
+            chat_id="oc_lab",
+            task_id=1,
+            applied_at=self.applied_at + timedelta(minutes=1),
+        )
+
+        reopened_at = self.applied_at + timedelta(minutes=2)
+        reason = "当前交付缺少实验日志，请补齐日志路径后重新提交。"
+        reopened = admin_service.apply_management_action(
+            LifecycleAction.REOPEN,
+            actor_open_id="ou_admin",
+            request_id="management-reopen-cycle-one",
+            chat_id="oc_lab",
+            task_id=1,
+            reason=reason,
+            applied_at=reopened_at,
+        )
+        replay = admin_service.apply_management_action(
+            LifecycleAction.REOPEN,
+            actor_open_id="ou_admin",
+            request_id="management-reopen-cycle-one",
+            chat_id="oc_lab",
+            task_id=1,
+            reason=reason,
+            applied_at=reopened_at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(reopened.previous_status, TaskStatus.DONE)
+        self.assertEqual(reopened.new_status, TaskStatus.TODO)
+        self.assertEqual(reopened.reminders_created, 4)
+        self.assertTrue(replay.already_applied)
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, 1)
+            event = session.get(TaskLifecycleEvent, reopened.event_id)
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 1,
+                    TaskCompletionSubmission.cycle == 1,
+                )
+            )
+            reopen_note = session.scalar(
+                select(TaskNote).where(
+                    TaskNote.task_id == 1,
+                    TaskNote.note_type == "reopen",
+                )
+            )
+            active_reminders = session.scalars(
+                select(TaskReminder).where(
+                    TaskReminder.task_id == 1,
+                    TaskReminder.status == ReminderStatus.SCHEDULED.value,
+                )
+            ).all()
+        assert task is not None
+        assert event is not None
+        assert submission is not None
+        assert reopen_note is not None
+        self.assertEqual(task.status, "todo")
+        self.assertEqual(task.review_status, "rework_required")
+        self.assertEqual(task.completion_cycle, 1)
+        self.assertIsNone(task.completed_at)
+        self.assertEqual(submission.review_status, "rework_required")
+        self.assertEqual(submission.reviewed_by_open_id, "ou_admin")
+        self.assertEqual(submission.review_reason, reason)
+        self.assertEqual(event.action, "reopen")
+        self.assertEqual(event.reason, reason)
+        self.assertEqual(event.from_review_status, "accepted")
+        self.assertEqual(event.to_review_status, "rework_required")
+        self.assertEqual(event.completion_cycle, 1)
+        self.assertEqual(reopen_note.content, reason)
+        self.assertEqual(reopen_note.completion_cycle, 1)
+        self.assertEqual(len(active_reminders), 4)
+
+        with self.assertRaisesRegex(LifecycleMutationError, "different"):
+            admin_service.apply_management_action(
+                LifecycleAction.REOPEN,
+                actor_open_id="ou_admin",
+                request_id="management-reopen-cycle-one",
+                chat_id="oc_lab",
+                task_id=1,
+                reason="另一条返工原因",
+                applied_at=reopened_at + timedelta(seconds=2),
+            )
+
+    def test_management_reopen_requires_reason_and_administrator(self) -> None:
+        self._service().apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at,
+        )
+        admin_service = self._service(admins={"ou_admin"})
+        for request_id, reason in (
+            ("reopen-missing", None),
+            ("reopen-blank", " \n "),
+            ("reopen-too-long", "原" * 2001),
+        ):
+            with self.subTest(request_id=request_id), self.assertRaisesRegex(
+                LifecycleMutationError, "reason"
+            ):
+                admin_service.apply_management_action(
+                    LifecycleAction.REOPEN,
+                    actor_open_id="ou_admin",
+                    request_id=request_id,
+                    chat_id="oc_lab",
+                    task_id=1,
+                    reason=reason,
+                    applied_at=self.applied_at + timedelta(minutes=1),
+                )
+        with self.assertRaisesRegex(LifecycleMutationError, "administrator"):
+            self._service().apply_management_action(
+                LifecycleAction.REOPEN,
+                actor_open_id="ou_owner",
+                request_id="reopen-owner-forbidden",
+                chat_id="oc_lab",
+                task_id=1,
+                reason="交付内容不完整",
+                applied_at=self.applied_at + timedelta(minutes=2),
+            )
+
+    def test_acceptance_failure_rolls_back_task_submission_and_audit(self) -> None:
+        self._service().apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at,
+        )
+        with (
+            patch(
+                "app.lifecycle.mutations.sync_task_reminders_in_session",
+                side_effect=RuntimeError("simulated acceptance sync failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "acceptance sync failure"),
+        ):
+            self._service(admins={"ou_admin"}).apply_management_action(
+                LifecycleAction.ACCEPT,
+                actor_open_id="ou_admin",
+                request_id="management-accept-rollback",
+                chat_id="oc_lab",
+                task_id=1,
+                applied_at=self.applied_at + timedelta(minutes=1),
+            )
+
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, 1)
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 1,
+                    TaskCompletionSubmission.cycle == 1,
+                )
+            )
+            accept_count = session.scalar(
+                select(func.count(TaskLifecycleEvent.id)).where(
+                    TaskLifecycleEvent.task_id == 1,
+                    TaskLifecycleEvent.action == "accept",
+                )
+            )
+        assert task is not None
+        assert submission is not None
+        self.assertEqual(task.review_status, "pending")
+        self.assertIsNone(task.reviewed_by_open_id)
+        self.assertIsNone(task.reviewed_at)
+        self.assertEqual(submission.review_status, "pending")
+        self.assertIsNone(submission.reviewed_by_open_id)
+        self.assertIsNone(submission.reviewed_at)
+        self.assertEqual(accept_count, 0)
 
     def test_management_restore_done_task_replans_and_is_idempotent(self) -> None:
         service = self._service(admins={"ou_admin"})
@@ -299,6 +777,66 @@ class LifecycleMutationTest(unittest.TestCase):
                 merge_target_task_id=2,
                 applied_at=self.applied_at + timedelta(minutes=4),
             )
+
+    def test_second_completion_after_restore_creates_a_new_immutable_cycle(
+        self,
+    ) -> None:
+        service = self._service(admins={"ou_admin"})
+        first = service.apply_management_action(
+            LifecycleAction.COMPLETE,
+            actor_open_id="ou_admin",
+            request_id="management-cycle-one",
+            chat_id="oc_lab",
+            task_id=1,
+            applied_at=self.applied_at,
+        )
+        service.apply_management_action(
+            LifecycleAction.RESTORE,
+            actor_open_id="ou_admin",
+            request_id="management-cycle-restore",
+            chat_id="oc_lab",
+            task_id=1,
+            applied_at=self.applied_at + timedelta(minutes=1),
+        )
+        second = self._service().apply_candidate(
+            self._candidate(1, LifecycleAction.COMPLETE, "om_owner_done"),
+            actor_open_id="ou_owner",
+            trigger_message_id="om_owner_done",
+            applied_at=self.applied_at + timedelta(minutes=2),
+        )
+
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, 1)
+            submissions = session.scalars(
+                select(TaskCompletionSubmission)
+                .where(TaskCompletionSubmission.task_id == 1)
+                .order_by(TaskCompletionSubmission.cycle)
+            ).all()
+            events = session.scalars(
+                select(TaskLifecycleEvent)
+                .where(TaskLifecycleEvent.id.in_((first.event_id, second.event_id)))
+                .order_by(TaskLifecycleEvent.id)
+            ).all()
+
+        assert task is not None
+        self.assertEqual(task.completion_cycle, 2)
+        self.assertEqual(task.last_completed_by_open_id, "ou_owner")
+        self.assertEqual([item.cycle for item in submissions], [1, 2])
+        self.assertEqual(
+            [item.submitted_by_open_id for item in submissions],
+            ["ou_admin", "ou_owner"],
+        )
+        self.assertEqual(submissions[0].submitted_by_name_snapshot, "导师")
+        self.assertIsNone(submissions[0].source_message_id)
+        self.assertIsNone(submissions[0].completion_note_id)
+        self.assertEqual(
+            submissions[0].content_snapshot,
+            "管理员在管理后台标记任务完成",
+        )
+        self.assertIsNotNone(submissions[1].completion_note_id)
+        self.assertEqual([event.completion_cycle for event in events], [1, 2])
+        self.assertEqual(events[0].actor_name_snapshot, "导师")
+        self.assertEqual(events[0].correlation_id, "management-cycle-one")
 
     def test_management_restore_cancelled_past_deadline_becomes_overdue(self) -> None:
         service = self._service(admins={"ou_admin"})
@@ -539,6 +1077,21 @@ class LifecycleMutationTest(unittest.TestCase):
                 ["ou_owner", "ou_coowner"],
             )
             self.assertEqual([event.action for event in events], ["rename", "reassign"])
+            self.assertEqual(
+                [event.actor_name_snapshot for event in events],
+                ["导师", "导师"],
+            )
+            self.assertEqual(
+                [event.correlation_id for event in events],
+                ["management-title-request", "management-assignees-request"],
+            )
+            self.assertTrue(
+                all(event.idempotency_key for event in events)
+            )
+            self.assertEqual(
+                [event.completion_cycle for event in events],
+                [0, 0],
+            )
 
         with self.assertRaisesRegex(LifecycleMutationError, "active member"):
             service.apply_management_action(
@@ -1031,6 +1584,17 @@ class LifecycleMutationTest(unittest.TestCase):
         self.assertEqual(first.event_id, replay.event_id)
         self.assertTrue(replay.already_applied)
         self._assert_event_count(1)
+        with session_scope(self.session_factory) as session:
+            submission_count = session.scalar(
+                select(func.count(TaskCompletionSubmission.id))
+            )
+            completion_note_count = session.scalar(
+                select(func.count(TaskNote.id)).where(
+                    TaskNote.note_type == "completion"
+                )
+            )
+        self.assertEqual(submission_count, 1)
+        self.assertEqual(completion_note_count, 1)
         with self.assertRaisesRegex(LifecycleMutationError, "different"):
             self._service().apply_candidate(
                 self._candidate(1, LifecycleAction.CANCEL, "om_owner_done"),
@@ -1063,6 +1627,14 @@ class LifecycleMutationTest(unittest.TestCase):
             evidence_count = session.scalar(
                 select(func.count(TaskLifecycleEvidence.event_id))
             )
+            submission_count = session.scalar(
+                select(func.count(TaskCompletionSubmission.id))
+            )
+            completion_note_count = session.scalar(
+                select(func.count(TaskNote.id)).where(
+                    TaskNote.note_type == "completion"
+                )
+            )
             active = session.scalar(
                 select(func.count(TaskReminder.id)).where(
                     TaskReminder.task_id == 1,
@@ -1070,6 +1642,8 @@ class LifecycleMutationTest(unittest.TestCase):
                 )
             )
         self.assertEqual(evidence_count, 0)
+        self.assertEqual(submission_count, 0)
+        self.assertEqual(completion_note_count, 0)
         self.assertEqual(active, 4)
 
     def test_reschedule_must_still_be_future_at_commit_time(self) -> None:
@@ -1102,14 +1676,37 @@ class LifecycleMutationTest(unittest.TestCase):
         self.assertEqual(result.reminders_cancelled, 4)
         with session_scope(self.session_factory) as session:
             event = session.get(TaskLifecycleEvent, result.event_id)
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 1
+                )
+            )
             self.assertEqual(event.trigger_source, "card_action")
+            self.assertEqual(event.actor_name_snapshot, "王政")
             self.assertIsNone(event.trigger_message_db_id)
             self.assertEqual(event.trigger_card_action_id, "evt_card_done")
             self.assertEqual(event.trigger_card_message_id, "om_card_list")
             self.assertEqual(event.trigger_card_chat_id, "oc_dm")
+            self.assertEqual(event.source_message_id, "om_card_list")
+            self.assertEqual(event.correlation_id, "evt_card_done")
+            self.assertEqual(event.from_review_status, "none")
+            self.assertEqual(event.to_review_status, "pending")
+            self.assertEqual(event.completion_cycle, 1)
             self.assertEqual(event.confidence, 1.0)
             self.assertIsNone(event.model)
             self.assertEqual(event.evidence_links, [])
+            self.assertIsNotNone(submission)
+            assert submission is not None
+            self.assertEqual(submission.submitted_by_open_id, "ou_owner")
+            self.assertEqual(submission.content_snapshot, "通过任务卡片标记完成")
+            self.assertEqual(submission.evidence_json, '["om_card_list"]')
+            self.assertIsNone(submission.completion_note_id)
+            completion_note_count = session.scalar(
+                select(func.count(TaskNote.id)).where(
+                    TaskNote.note_type == "completion"
+                )
+            )
+            self.assertEqual(completion_note_count, 0)
 
     def test_shared_co_owner_can_complete_and_cancels_everyones_reminders(self) -> None:
         with session_scope(self.session_factory) as session:
@@ -1150,6 +1747,19 @@ class LifecycleMutationTest(unittest.TestCase):
         )
         self.assertEqual(result.reminders_cancelled, 8)
         self._assert_task_status(3, "done")
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, 3)
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 3
+                )
+            )
+        assert task is not None
+        assert submission is not None
+        self.assertEqual(task.last_completed_by_open_id, "ou_coowner")
+        self.assertEqual(task.last_completed_by_name, "李四")
+        self.assertEqual(submission.submitted_by_open_id, "ou_coowner")
+        self.assertEqual(submission.submitted_by_name_snapshot, "李四")
 
     def test_administrator_can_cancel_from_card(self) -> None:
         result = self._service(admins={"ou_admin"}).apply_card_action(
@@ -1167,6 +1777,17 @@ class LifecycleMutationTest(unittest.TestCase):
             LifecycleAuthorizationRole.ADMINISTRATOR,
         )
         self.assertEqual(result.new_status, TaskStatus.CANCELLED)
+        with session_scope(self.session_factory) as session:
+            event = session.get(TaskLifecycleEvent, result.event_id)
+            self.assertEqual(event.actor_name_snapshot, "导师")
+            self.assertEqual(event.source_message_id, "om_admin_card")
+            self.assertEqual(event.correlation_id, "evt_card_cancel")
+            self.assertTrue(
+                event.idempotency_key.startswith("lifecycle:card_action:")
+            )
+            self.assertEqual(event.from_review_status, "none")
+            self.assertEqual(event.to_review_status, "none")
+            self.assertEqual(event.completion_cycle, 0)
 
     def test_card_action_rechecks_authorization_allowlist_and_code(self) -> None:
         cases = (
@@ -1204,6 +1825,11 @@ class LifecycleMutationTest(unittest.TestCase):
                 )
         self._assert_task_status(1, "todo")
         self._assert_event_count(0)
+        with session_scope(self.session_factory) as session:
+            submission_count = session.scalar(
+                select(func.count(TaskCompletionSubmission.id))
+            )
+        self.assertEqual(submission_count, 0)
 
     def test_card_callback_replay_is_idempotent_and_globally_bound(self) -> None:
         kwargs = {
@@ -1226,6 +1852,11 @@ class LifecycleMutationTest(unittest.TestCase):
 
         self.assertEqual(first.event_id, replay.event_id)
         self.assertTrue(replay.already_applied)
+        with session_scope(self.session_factory) as session:
+            submission_count = session.scalar(
+                select(func.count(TaskCompletionSubmission.id))
+            )
+        self.assertEqual(submission_count, 1)
         with self.assertRaisesRegex(LifecycleMutationError, "different"):
             self._service().apply_card_action(
                 LifecycleAction.COMPLETE,
@@ -1366,6 +1997,12 @@ class LifecycleMutationTest(unittest.TestCase):
 
         self._assert_task_status(1, "todo")
         self._assert_event_count(0)
+
+        with session_scope(self.session_factory) as session:
+            submission_count = session.scalar(
+                select(func.count(TaskCompletionSubmission.id))
+            )
+        self.assertEqual(submission_count, 0)
 
     def _service(
         self,

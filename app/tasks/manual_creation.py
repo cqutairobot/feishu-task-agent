@@ -21,6 +21,7 @@ from app.database.models import (
     Task,
     TaskAssignee,
     TaskCreationEvent,
+    User,
 )
 from app.notifications.repository import (
     create_task_assignment_notifications_in_session,
@@ -136,10 +137,20 @@ class ManagementTaskCreationService:
                 open_ids=owner_open_ids,
             )
             primary = owners[0]
+            creator_name = _creator_name(
+                session,
+                chat_id=chat_id,
+                open_id=actor_open_id,
+            )
             task = Task(
                 chat_id=chat_id,
                 owner_open_id=primary.open_id,
                 owner_name_snapshot=primary.name,
+                created_by_open_id=actor_open_id,
+                created_by_name=creator_name,
+                created_via="management",
+                creator_attribution_basis="explicit_assignment",
+                creator_attribution_confidence=1.0,
                 title=title,
                 normalized_title=title.casefold(),
                 description=description,
@@ -228,6 +239,26 @@ def _verified_owners(
             )
         owners.append(TaskOwner(name=binding.alias, open_id=open_id))
     return tuple(owners)
+
+
+def _creator_name(
+    session: Session,
+    *,
+    chat_id: str,
+    open_id: str,
+) -> str | None:
+    """Snapshot the administrator's group task name, then Feishu name."""
+
+    alias = session.scalar(
+        select(ChatMemberAlias.alias).where(
+            ChatMemberAlias.chat_id == chat_id,
+            ChatMemberAlias.open_id == open_id,
+        )
+    )
+    if isinstance(alias, str) and alias.strip():
+        return alias.strip()
+    name = session.scalar(select(User.name).where(User.open_id == open_id))
+    return name.strip() if isinstance(name, str) and name.strip() else None
 
 
 def _validate_replay(

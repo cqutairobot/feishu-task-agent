@@ -11,7 +11,21 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import ReminderSettings
 from app.database.engine import session_scope
-from app.database.models import Chat, ChatSettings, Message, Task, TaskReminder
+from app.database.models import (
+    Chat,
+    ChatSettings,
+    Message,
+    Task,
+    TaskLifecycleEvent,
+    TaskReminder,
+    User,
+)
+from app.system_lifecycle import (
+    SYSTEM_ACTOR_TENANT_KEY,
+    SYSTEM_REMINDER_ACTOR_NAME,
+    SYSTEM_REMINDER_ACTOR_OPEN_ID,
+    overdue_transition_key,
+)
 from app.reminders.schedule import ReminderKind, reminder_moments
 
 
@@ -509,15 +523,11 @@ def sync_task_reminders_in_session(
     """Synchronize one task inside its caller's transaction."""
 
     synced_at = _aware_utc(synced_at, "synced_at")
-    status_changed = False
-    if (
-        task.status == "todo"
-        and task.deadline is not None
-        and task.deadline <= synced_at
-    ):
-        task.status = "overdue"
-        task.updated_at = synced_at
-        status_changed = True
+    status_changed = _mark_overdue_with_audit(
+        session,
+        task,
+        changed_at=synced_at,
+    )
 
     existing = tuple(
         session.scalars(
@@ -631,6 +641,98 @@ def sync_task_reminders_in_session(
         created=created,
         cancelled=cancelled,
     )
+
+
+def _mark_overdue_with_audit(
+    session: Session,
+    task: Task,
+    *,
+    changed_at: datetime,
+) -> bool:
+    """Atomically mark one due task overdue and append its system event."""
+
+    # Import lazily because ``app.tasks.repository`` itself uses this reminder
+    # transaction helper. Loading the task package while this module is still
+    # being initialized would otherwise form a circular import.
+    from app.tasks.codes import format_task_code
+
+    if (
+        task.status != "todo"
+        or task.deadline is None
+        or task.deadline > changed_at
+    ):
+        return False
+
+    deadline = task.deadline
+    idempotency_key = overdue_transition_key(task.id, deadline)
+    existing_event = session.scalar(
+        select(TaskLifecycleEvent).where(
+            TaskLifecycleEvent.idempotency_key == idempotency_key
+        )
+    )
+
+    task.status = "overdue"
+    task.updated_at = changed_at
+    if existing_event is not None:
+        return True
+
+    system_actor = session.get(User, SYSTEM_REMINDER_ACTOR_OPEN_ID)
+    if system_actor is None:
+        system_actor = User(
+            open_id=SYSTEM_REMINDER_ACTOR_OPEN_ID,
+            union_id=None,
+            name=SYSTEM_REMINDER_ACTOR_NAME,
+            tenant_key=SYSTEM_ACTOR_TENANT_KEY,
+            last_seen_at=changed_at,
+            created_at=changed_at,
+            updated_at=changed_at,
+        )
+        session.add(system_actor)
+        session.flush()
+
+    session.add(
+        TaskLifecycleEvent(
+            task_id=task.id,
+            actor_open_id=SYSTEM_REMINDER_ACTOR_OPEN_ID,
+            actor_name_snapshot=SYSTEM_REMINDER_ACTOR_NAME,
+            trigger_source="system",
+            trigger_message_db_id=None,
+            trigger_card_action_id=None,
+            trigger_card_message_id=None,
+            trigger_card_chat_id=None,
+            trigger_management_request_id=None,
+            source_message_id=None,
+            correlation_id=idempotency_key,
+            idempotency_key=idempotency_key,
+            action="overdue",
+            authorization_role="system",
+            task_code_snapshot=format_task_code(task.id),
+            previous_status="todo",
+            new_status="overdue",
+            deadline_before=deadline,
+            deadline_after=deadline,
+            title_before=None,
+            title_after=None,
+            assignees_before_json=None,
+            assignees_after_json=None,
+            from_review_status=task.review_status,
+            to_review_status=task.review_status,
+            reason="任务截止时间已到，系统自动标记为逾期",
+            completion_cycle=task.completion_cycle,
+            merge_target_task_id=None,
+            confidence=1.0,
+            provider=None,
+            model=None,
+            response_format=None,
+            model_request_id=None,
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+            applied_at=changed_at,
+            created_at=changed_at,
+        )
+    )
+    return True
 
 
 def _was_superseded_by_more_urgent_stage(

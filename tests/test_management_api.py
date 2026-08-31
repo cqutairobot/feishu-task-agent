@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 import unittest
 
 from sqlalchemy import func, select
@@ -22,7 +23,11 @@ from app.database.models import (
     Message,
     Task,
     TaskAssignee,
+    TaskCompletionSubmission,
     TaskEvidence,
+    TaskLifecycleEvent,
+    TaskNote,
+    TaskNotification,
     User,
 )
 from app.management.access import (
@@ -281,9 +286,169 @@ class ManagementReadApiTest(unittest.TestCase):
         self.assertEqual(detail.evidence[0].message_id, "om_evidence_a")
         self.assertEqual(detail.evidence[0].content, "王政完成前端页面")
         self.assertEqual(detail.lifecycle, ())
+        self.assertIsNone(detail.responsibility.publisher_open_id)
+        self.assertEqual(
+            [item.name for item in detail.responsibility.assignees], ["王政"]
+        )
+        self.assertEqual(detail.completion_submissions, ())
         self.assertEqual(detail.deliveries, ())
+        self.assertEqual(
+            [(item.event_type, item.action) for item in detail.timeline],
+            [("created", "create")],
+        )
         with self.assertRaisesRegex(ManagementQueryError, "does not exist"):
             self.api.task_detail("ou_admin", "oc_a", self.task_b_id)
+
+    def test_task_detail_returns_complete_provenance_chain_and_timeline(
+        self,
+    ) -> None:
+        self._grant_admin()
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, self.task_a_id)
+            assert task is not None
+            task.status = "done"
+            task.created_by_open_id = "ou_admin"
+            task.created_by_name = "历史发布人"
+            task.created_via = "detected"
+            task.creator_attribution_basis = "message_sender"
+            task.creator_attribution_confidence = 1.0
+            task.completion_cycle = 1
+            task.completed_at = self.now + timedelta(hours=2)
+            task.last_completed_by_open_id = "ou_owner"
+            task.last_completed_by_name = "历史完成人"
+            task.last_completed_at = self.now + timedelta(hours=2)
+            task.review_status = "accepted"
+            task.reviewed_by_open_id = "ou_admin"
+            task.reviewed_by_name = "历史复核人"
+            task.reviewed_at = self.now + timedelta(hours=3)
+            session.add(
+                TaskNote(
+                    task_id=task.id,
+                    chat_id="oc_a",
+                    author_open_id="ou_owner",
+                    author_name_snapshot="历史完成人",
+                    note_type="progress",
+                    content="已完成第一轮训练，正在整理日志。",
+                    source_message_id="om_progress_1",
+                    source_chat_id="oc_a",
+                    completion_cycle=0,
+                    idempotency_key="trace-note-1",
+                    created_at=self.now + timedelta(hours=1),
+                )
+            )
+            session.add(
+                TaskCompletionSubmission(
+                    task_id=task.id,
+                    chat_id="oc_a",
+                    cycle=1,
+                    submitted_by_open_id="ou_owner",
+                    submitted_by_name_snapshot="历史完成人",
+                    source_message_id="om_completion_1",
+                    completion_note_id=None,
+                    content_snapshot="均值、方差和日志路径已经上传。",
+                    evidence_json=json.dumps(
+                        ["om_completion_1", "om_evidence_a"],
+                        ensure_ascii=False,
+                    ),
+                    submitted_at=self.now + timedelta(hours=2),
+                    review_status="accepted",
+                    reviewed_by_open_id="ou_admin",
+                    reviewed_at=self.now + timedelta(hours=3),
+                    review_reason=None,
+                    idempotency_key="trace-completion-1",
+                )
+            )
+            lifecycle = TaskLifecycleEvent(
+                task_id=task.id,
+                actor_open_id="ou_admin",
+                actor_name_snapshot="历史复核人",
+                trigger_source="management_page",
+                trigger_management_request_id="trace-review-request-1",
+                source_message_id=None,
+                correlation_id="trace-review-request-1",
+                idempotency_key="trace-review-1",
+                action="accept",
+                authorization_role="administrator",
+                task_code_snapshot=format_task_code(task.id),
+                previous_status="done",
+                new_status="done",
+                deadline_before=task.deadline,
+                deadline_after=task.deadline,
+                from_review_status="pending",
+                to_review_status="accepted",
+                completion_cycle=1,
+                confidence=1.0,
+                applied_at=self.now + timedelta(hours=3),
+                created_at=self.now + timedelta(hours=3),
+            )
+            session.add(lifecycle)
+            session.flush()
+            session.add(
+                TaskNotification(
+                    task_id=task.id,
+                    source_lifecycle_event_id=lifecycle.id,
+                    kind="task_done_admin",
+                    recipient_open_id="ou_admin",
+                    dedupe_key="trace-notification-1",
+                    task_code_snapshot=format_task_code(task.id),
+                    owner_open_id_snapshot="ou_owner",
+                    owner_name_snapshot="历史完成人",
+                    title_snapshot=task.title,
+                    status_snapshot="done",
+                    deadline_snapshot=task.deadline,
+                    deadline_before_snapshot=task.deadline,
+                    reason_snapshot=None,
+                    scheduled_for=self.now + timedelta(hours=4),
+                    available_at=self.now + timedelta(hours=4),
+                    status="scheduled",
+                    attempt_count=0,
+                    max_attempts=3,
+                    created_at=self.now + timedelta(hours=4),
+                    updated_at=self.now + timedelta(hours=4),
+                )
+            )
+
+        detail = self.api.task_detail("ou_admin", "oc_a", self.task_a_id)
+
+        self.assertEqual(detail.task.created_by_name, "历史发布人")
+        self.assertEqual(detail.responsibility.publisher_open_id, "ou_admin")
+        self.assertEqual(detail.responsibility.publisher_name, "历史发布人")
+        self.assertEqual(
+            detail.responsibility.latest_completer_name, "历史完成人"
+        )
+        self.assertEqual(
+            detail.responsibility.latest_reviewer_name, "历史复核人"
+        )
+        self.assertEqual(len(detail.completion_submissions), 1)
+        submission = detail.completion_submissions[0]
+        self.assertEqual(submission.cycle, 1)
+        self.assertEqual(submission.reviewed_by_name, "历史复核人")
+        self.assertEqual(
+            submission.evidence_message_ids,
+            ("om_completion_1", "om_evidence_a"),
+        )
+        self.assertEqual(len(detail.deliveries), 1)
+        self.assertEqual(
+            detail.deliveries[0].source_lifecycle_event_id,
+            detail.lifecycle[0].event_id,
+        )
+        self.assertEqual(
+            [item.event_type for item in detail.timeline],
+            [
+                "created",
+                "note",
+                "completion_submission",
+                "lifecycle",
+                "delivery",
+            ],
+        )
+        self.assertEqual(detail.timeline[1].source_message_id, "om_progress_1")
+        self.assertEqual(
+            detail.timeline[2].evidence_message_ids,
+            ("om_completion_1", "om_evidence_a"),
+        )
+        self.assertEqual(detail.timeline[3].to_review_status, "accepted")
+        self.assertEqual(detail.timeline[4].delivery_status, "scheduled")
 
     def test_unauthorized_reads_fail_before_resource_lookup(self) -> None:
         self._grant_admin()

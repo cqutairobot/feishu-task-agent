@@ -64,6 +64,78 @@ class TaskDetectionBatchContractTest(unittest.TestCase):
         self.assertEqual(result.candidates[0].owner.open_id, "ou_wang")
         self.assertEqual(result.candidates[1].owner.open_id, "ou_li")
 
+    def test_accepts_grounded_publisher_attribution(self) -> None:
+        candidate = self._candidate(
+            publisher={"name": "老师", "open_id": "ou_teacher"},
+            publisher_attribution_basis="message_sender",
+            publisher_attribution_confidence=0.99,
+        )
+
+        result = self._parse({"candidates": [candidate]})
+
+        self.assertEqual(result.candidates[0].publisher.open_id, "ou_teacher")
+        self.assertEqual(
+            result.candidates[0].publisher_attribution_basis,
+            "message_sender",
+        )
+        self.assertEqual(
+            result.candidates[0].publisher_attribution_confidence,
+            0.99,
+        )
+
+    def test_rejects_publisher_not_grounded_in_evidence_sender(self) -> None:
+        candidate = self._candidate(
+            publisher={"name": "李四", "open_id": "ou_li"},
+            publisher_attribution_basis="message_sender",
+            publisher_attribution_confidence=0.8,
+        )
+
+        with self.assertRaisesRegex(TaskOutputError, "grounded in an evidence"):
+            self._parse({"candidates": [candidate]})
+
+    def test_accepts_explicit_publisher_named_in_meeting_minutes(self) -> None:
+        timestamp = self.context.reference_time
+        context = TaskDetectionContext(
+            chat_id="oc_a",
+            trigger_message_id="om_minutes",
+            timezone="Asia/Shanghai",
+            reference_time=timestamp,
+            participants=self.context.participants,
+            messages=(
+                ContextMessage(
+                    "om_minutes",
+                    "ou_li",
+                    "李四",
+                    "会议纪要：老师安排王政补充 baseline 实验。",
+                    timestamp,
+                ),
+            ),
+            focus_message_ids=("om_minutes",),
+        )
+        candidate = self._candidate(
+            evidence=["om_minutes"],
+            publisher={"name": "老师", "open_id": "ou_teacher"},
+            publisher_attribution_basis="explicit_assignment",
+            publisher_attribution_confidence=0.91,
+        )
+
+        result = parse_task_detection_batch_json(
+            json.dumps({"candidates": [candidate]}, ensure_ascii=False),
+            context,
+        )
+
+        self.assertEqual(result.candidates[0].publisher.open_id, "ou_teacher")
+
+    def test_rejects_partial_publisher_fields(self) -> None:
+        candidate = self._candidate()
+        candidate["publisher"] = {
+            "name": "老师",
+            "open_id": "ou_teacher",
+        }
+
+        with self.assertRaisesRegex(TaskOutputError, r"candidate\[0\] fields"):
+            self._parse({"candidates": [candidate]})
+
     def test_accepts_empty_candidates_for_no_task(self) -> None:
         result = self._parse({"candidates": []})
 
@@ -191,6 +263,22 @@ class TaskDetectionBatchContractTest(unittest.TestCase):
         self.assertFalse(
             candidate_schema["properties"]["owner"]["additionalProperties"]
         )
+        self.assertEqual(
+            set(candidate_schema["required"]),
+            {
+                "assignment_mode",
+                "confidence",
+                "co_owners",
+                "owner",
+                "title",
+                "description",
+                "deadline",
+                "evidence_message_ids",
+                "publisher",
+                "publisher_attribution_basis",
+                "publisher_attribution_confidence",
+            },
+        )
 
     def _parse(self, payload: dict):
         return parse_task_detection_batch_json(
@@ -207,8 +295,11 @@ class TaskDetectionBatchContractTest(unittest.TestCase):
         evidence: list[str] | None = None,
         assignment_mode: str = "single",
         co_owners: list[dict[str, str]] | None = None,
+        publisher: dict[str, str] | None = None,
+        publisher_attribution_basis: str | None = None,
+        publisher_attribution_confidence: float | None = None,
     ) -> dict:
-        return {
+        candidate = {
             "assignment_mode": assignment_mode,
             "confidence": 0.96,
             "co_owners": [] if co_owners is None else co_owners,
@@ -218,6 +309,19 @@ class TaskDetectionBatchContractTest(unittest.TestCase):
             "deadline": deadline,
             "evidence_message_ids": ["om_1"] if evidence is None else evidence,
         }
+        if publisher is not None:
+            candidate["publisher"] = publisher
+            candidate["publisher_attribution_basis"] = (
+                "message_sender"
+                if publisher_attribution_basis is None
+                else publisher_attribution_basis
+            )
+            candidate["publisher_attribution_confidence"] = (
+                0.9
+                if publisher_attribution_confidence is None
+                else publisher_attribution_confidence
+            )
+        return candidate
 
 
 if __name__ == "__main__":

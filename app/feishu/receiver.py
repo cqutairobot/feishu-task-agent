@@ -31,6 +31,11 @@ from app.lifecycle.private_commands import (
     PrivateLifecycleCommandProcessor,
     is_private_lifecycle_command_message,
 )
+from app.lifecycle.review_commands import PrivateReviewCommandProcessor
+from app.tasks.note_commands import (
+    PrivateTaskNoteCommandProcessor,
+    is_private_task_note_message,
+)
 from app.management.access import ChatAdministratorRepository
 from app.management.commands import (
     ManagementCommandProcessor,
@@ -70,6 +75,8 @@ def _on_message(
     lifecycle_commands: PrivateLifecycleCommandProcessor | None = None,
     management_commands: ManagementCommandProcessor | None = None,
     group_management_commands: GroupManagementCommandProcessor | None = None,
+    note_commands: PrivateTaskNoteCommandProcessor | None = None,
+    review_commands: PrivateReviewCommandProcessor | None = None,
 ) -> None:
     """Normalize and print one SDK message event without exposing credentials."""
 
@@ -117,6 +124,13 @@ def _on_message(
                 lifecycle_commands is not None
                 and lifecycle_commands.matches(message)
             )
+            note_command = is_private_task_note_message(message) or (
+                note_commands is not None and note_commands.matches(message)
+            )
+            review_command = (
+                review_commands is not None
+                and review_commands.matches(message)
+            )
             management_command = is_management_command_message(message) or (
                 management_commands is not None
                 and management_commands.matches(message)
@@ -134,6 +148,8 @@ def _on_message(
                     identity_command
                     or task_command
                     or lifecycle_command
+                    or note_command
+                    or review_command
                     or management_command
                     or group_management_command
                 ),
@@ -166,6 +182,8 @@ def _on_message(
             ("identity_command", identity_commands),
             ("group_management_command", group_management_commands),
             ("task_command", task_commands),
+            ("review_intent_read_only", review_commands),
+            ("task_note_command", note_commands),
             ("lifecycle_command", lifecycle_commands),
             ("management_command", management_commands),
         )
@@ -268,6 +286,8 @@ def start_listener(
     card_actions: TaskCardActionProcessor | None = None,
     chat_administrator_repository: ChatAdministratorRepository | None = None,
     management_commands: ManagementCommandProcessor | None = None,
+    note_commands: PrivateTaskNoteCommandProcessor | None = None,
+    review_commands: PrivateReviewCommandProcessor | None = None,
 ) -> None:
     """Start the blocking Feishu WebSocket listener."""
 
@@ -338,6 +358,8 @@ def start_listener(
             lifecycle_commands,
             management_commands,
             group_management_commands,
+            note_commands,
+            review_commands,
         )
     )
     if card_actions is not None:
@@ -395,6 +417,22 @@ def start_listener(
             "Private lifecycle commands enabled; one valid task code per "
             "message; authorized writes active."
         )
+    if note_commands is not None:
+        print(
+            "Private task-note commands enabled; responsible members and "
+            "administrators may append natural-language notes."
+        )
+    if review_commands is not None:
+        if getattr(review_commands, "review_writes_enabled", False):
+            print(
+                "Private review commands enabled; explicit confirmation "
+                "is required before accept/reopen writes."
+            )
+        else:
+            print(
+                "Private review-intent detection enabled in read-only mode; "
+                "accept/reopen decisions never mutate tasks."
+            )
     if management_commands is not None:
         print(
             "Private management login command enabled; one-time links active."

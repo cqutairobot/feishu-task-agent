@@ -152,6 +152,15 @@ class OpenAICompatibleTaskDetectorTest(unittest.TestCase):
         self.assertEqual(broad["context"]["task_scope"], "broad")
         self.assertEqual(work_only["context"]["task_scope"], "work_only")
 
+    def test_batch_prompt_requires_task_publisher_provenance(self) -> None:
+        payload = build_task_batch_detection_input(self.context)
+
+        self.assertIn("publisher", payload["instructions"])
+        candidate_contract = payload["output_contract"]["candidates"][0]
+        self.assertIn("publisher", candidate_contract)
+        self.assertIn("publisher_attribution_basis", candidate_contract)
+        self.assertIn("publisher_attribution_confidence", candidate_contract)
+
     def test_batch_prompt_defines_date_only_deadline_as_end_of_day(self) -> None:
         payload = build_task_batch_detection_input(self.context)
         instructions = payload["instructions"]

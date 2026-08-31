@@ -83,6 +83,40 @@ class DirectoryServiceTest(unittest.TestCase):
 
         self.assertEqual(self.provider.calls, 2)
 
+    def test_management_refresh_keeps_existing_chat_tenant(self) -> None:
+        self.snapshot = DirectorySnapshot(
+            chat_id="oc_test",
+            chat_name="外部协作群",
+            chat_tenant_key="tenant_that_owns_external_chat",
+            owner_open_id="ou_test",
+            members=self.snapshot.members,
+        )
+        self.provider.snapshot = self.snapshot
+
+        self.service.refresh_strict("oc_test")
+
+        self.repository.apply_directory_snapshot.assert_called_once_with(
+            "oc_test",
+            "外部协作群",
+            {"ou_test": "张三"},
+            owner_open_id="ou_test",
+            member_tenant_keys={"ou_test": "tenant_test"},
+            authoritative_members=True,
+            chat_type=None,
+            tenant_key=None,
+            updated_at=unittest.mock.ANY,
+        )
+
+    def test_new_chat_refresh_can_use_directory_tenant(self) -> None:
+        self.service.refresh_strict("oc_test", chat_type="group")
+
+        self.assertEqual(
+            self.repository.apply_directory_snapshot.call_args.kwargs[
+                "tenant_key"
+            ],
+            "tenant_test",
+        )
+
     def test_lookup_failure_keeps_message_usable(self) -> None:
         provider = Mock()
         provider.fetch.side_effect = RuntimeError("temporary API failure")

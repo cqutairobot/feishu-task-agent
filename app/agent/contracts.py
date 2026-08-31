@@ -38,6 +38,13 @@ CANDIDATE_EXPECTED_FIELDS = frozenset(
         "evidence_message_ids",
     }
 )
+CANDIDATE_PROVENANCE_FIELDS = frozenset(
+    {
+        "publisher",
+        "publisher_attribution_basis",
+        "publisher_attribution_confidence",
+    }
+)
 MAX_TASK_CANDIDATES = 10
 MAX_TASK_ASSIGNEES = 20
 
@@ -97,6 +104,9 @@ class TaskCandidate:
     evidence_message_ids: tuple[str, ...]
     assignment_mode: TaskAssignmentMode = TaskAssignmentMode.SINGLE
     co_owners: tuple[TaskOwner, ...] = ()
+    publisher: TaskOwner | None = None
+    publisher_attribution_basis: str = "unknown"
+    publisher_attribution_confidence: float | None = None
 
     @property
     def owners(self) -> tuple[TaskOwner, ...]:
@@ -122,6 +132,16 @@ class TaskCandidate:
                 else self.deadline.astimezone(SHANGHAI_TZ).isoformat()
             ),
             "evidence_message_ids": list(self.evidence_message_ids),
+            "publisher": (
+                None
+                if self.publisher is None
+                else {
+                    "name": self.publisher.name,
+                    "open_id": self.publisher.open_id,
+                }
+            ),
+            "publisher_attribution_basis": self.publisher_attribution_basis,
+            "publisher_attribution_confidence": self.publisher_attribution_confidence,
         }
 
 
@@ -236,8 +256,38 @@ def task_detection_batch_json_schema() -> dict[str, object]:
                             "minItems": 1,
                             "items": {"type": "string"},
                         },
+                        "publisher": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "open_id": {"type": "string"},
+                                    },
+                                    "required": ["name", "open_id"],
+                                    "additionalProperties": False,
+                                },
+                                {"type": "null"},
+                            ]
+                        },
+                        "publisher_attribution_basis": {
+                            "type": "string",
+                            "enum": [
+                                "message_sender",
+                                "explicit_assignment",
+                                "unknown",
+                            ],
+                        },
+                        "publisher_attribution_confidence": {
+                            "anyOf": [
+                                {"type": "number", "minimum": 0, "maximum": 1},
+                                {"type": "null"},
+                            ]
+                        },
                     },
-                    "required": sorted(CANDIDATE_EXPECTED_FIELDS),
+                    "required": sorted(
+                        CANDIDATE_EXPECTED_FIELDS | CANDIDATE_PROVENANCE_FIELDS
+                    ),
                     "additionalProperties": False,
                 },
             }
@@ -349,7 +399,12 @@ def parse_task_detection_batch_json(
     candidates: list[TaskCandidate] = []
     fingerprints: set[tuple[str, str, tuple[str, ...]]] = set()
     for index, value in enumerate(raw_candidates):
-        if not isinstance(value, dict) or frozenset(value) != CANDIDATE_EXPECTED_FIELDS:
+        actual_fields = frozenset(value) if isinstance(value, dict) else frozenset()
+        allowed_fields = {
+            CANDIDATE_EXPECTED_FIELDS,
+            CANDIDATE_EXPECTED_FIELDS | CANDIDATE_PROVENANCE_FIELDS,
+        }
+        if actual_fields not in allowed_fields:
             actual = set(value) if isinstance(value, dict) else set()
             missing = sorted(CANDIDATE_EXPECTED_FIELDS - actual)
             extra = sorted(actual - CANDIDATE_EXPECTED_FIELDS)
@@ -374,6 +429,21 @@ def parse_task_detection_batch_json(
             evidence_message_ids=evidence,
             assignment_mode=_assignment_mode(value["assignment_mode"]),
             co_owners=_co_owners(value["co_owners"]),
+            publisher=(
+                None
+                if "publisher" not in value
+                else _publisher(value["publisher"])
+            ),
+            publisher_attribution_basis=(
+                "unknown"
+                if "publisher_attribution_basis" not in value
+                else _publisher_basis(value["publisher_attribution_basis"])
+            ),
+            publisher_attribution_confidence=(
+                None
+                if "publisher_attribution_confidence" not in value
+                else _optional_confidence(value["publisher_attribution_confidence"])
+            ),
         )
         _validate_assignment(candidate, index=index)
         _validate_grounding(candidate, context)
@@ -421,6 +491,27 @@ def _owner(value: Any) -> TaskOwner:
             value["open_id"], "owner.open_id", maximum=128
         ),
     )
+
+
+def _publisher(value: Any) -> TaskOwner | None:
+    if value is None:
+        return None
+    return _owner(value)
+
+
+def _publisher_basis(value: Any) -> str:
+    if value not in {"message_sender", "explicit_assignment", "unknown"}:
+        raise TaskOutputError(
+            "publisher_attribution_basis must be message_sender, "
+            "explicit_assignment, or unknown"
+        )
+    return value
+
+
+def _optional_confidence(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _confidence(value)
 
 
 def _co_owners(value: Any) -> tuple[TaskOwner, ...]:
@@ -537,3 +628,68 @@ def _validate_grounding(
             raise TaskOutputError(
                 "owner.name does not match the confirmed names for owner.open_id"
             )
+
+    if isinstance(result, TaskCandidate):
+        publisher = result.publisher
+        if publisher is None:
+            if (
+                result.publisher_attribution_basis != "unknown"
+                or result.publisher_attribution_confidence is not None
+            ):
+                raise TaskOutputError(
+                    "publisher attribution must be unknown when publisher is null"
+                )
+        else:
+            participant = next(
+                (
+                    item
+                    for item in context.participants
+                    if item.open_id == publisher.open_id
+                ),
+                None,
+            )
+            if participant is None:
+                raise TaskOutputError(
+                    "publisher.open_id is not a known participant"
+                )
+            accepted_names = {
+                normalize_alias(name) for name in participant.accepted_names
+            }
+            if normalize_alias(publisher.name) not in accepted_names:
+                raise TaskOutputError(
+                    "publisher.name does not match the confirmed names for "
+                    "publisher.open_id"
+                )
+            if result.publisher_attribution_basis == "unknown":
+                raise TaskOutputError(
+                    "publisher attribution basis is required when publisher is set"
+                )
+            if result.publisher_attribution_confidence is None:
+                raise TaskOutputError(
+                    "publisher attribution confidence is required when publisher is set"
+                )
+            evidence_messages = tuple(
+                message
+                for message in context.messages
+                if message.message_id in result.evidence_message_ids
+            )
+            if result.publisher_attribution_basis == "message_sender":
+                if not any(
+                    message.sender_open_id == publisher.open_id
+                    for message in evidence_messages
+                ):
+                    raise TaskOutputError(
+                        "publisher must be grounded in an evidence message sender"
+                    )
+            elif not any(
+                normalize_alias(publisher.name)
+                in normalize_alias(message.content)
+                or any(
+                    mention.open_id == publisher.open_id
+                    for mention in message.mentions
+                )
+                for message in evidence_messages
+            ):
+                raise TaskOutputError(
+                    "explicit publisher must be named or mentioned in evidence"
+                )

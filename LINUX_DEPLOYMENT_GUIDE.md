@@ -353,6 +353,8 @@ MANAGEMENT_WEB_COOKIE_SECURE=false
 | `TASK_LLM_BASE_URL` | OpenAI 兼容 API 地址。 |
 | `TASK_LLM_MODEL` | 实际使用的模型名称。 |
 | `DETECTION_DEBOUNCE_SECONDS` | 等待连续上下文的时间，当前默认 20 秒。 |
+| `LIFECYCLE_PRIVATE_WRITES_ENABLED` | 是否允许负责人私聊完成、延期、取消等任务操作。 |
+| `LIFECYCLE_REVIEW_WRITES_ENABLED` | 是否允许管理员私聊验收/返工；必须同时开启上一项。 |
 | `REMINDER_TEST_MODE` | 仅临时验收提醒时使用；正式环境必须为 `false`。 |
 | `MANAGEMENT_WEB_ENABLED` | 是否启用管理后台。 |
 | `DEPLOY_PUBLIC_URL` | 飞书登录链接和浏览器实际访问的完整公网入口。 |
@@ -620,12 +622,27 @@ live_volume_untouched: feishu-task-agent_task-data
 `git pull --ff-only` 更新，但镜像应在 OrbStack 重建、上传并通过 `docker load` 导入；
 完整步骤见 [《阿里云 ECS 部署指南》](ALIYUN_ECS_DEPLOYMENT_GUIDE.md)。
 
-不要直接在服务器上修改源码。升级前先备份：
+不要直接在服务器上修改源码。升级前先记录当前提交、数据库计数和容器使用的镜像：
 
 ```bash
 cd ~/feishu-task-agent
-./scripts/docker-backup.sh
+OLD_COMMIT=$(git rev-parse HEAD)
+echo "$OLD_COMMIT"
+docker compose exec -T management-api python -m app db-status \
+  | tee "$HOME/feishu-task-agent-backups/pre-upgrade-db-status.txt"
+docker compose images
 ```
+
+然后创建并隔离验证一致性备份：
+
+```bash
+./scripts/docker-backup.sh
+LATEST_BACKUP=$(ls -1t "$HOME"/feishu-task-agent-backups/feishu-task-agent-*.db | head -n 1)
+./scripts/docker-verify-backup.sh "$LATEST_BACKUP"
+```
+
+只有同时看到 `backup_integrity: ok`、`source_integrity: ok` 和
+`restore_verification: ok` 才继续。备份必须位于 Docker 命名卷之外。
 
 确认工作树干净并记录旧版本：
 
@@ -644,17 +661,69 @@ git log -1 --oneline
 `--ff-only` 表示只接受清晰的直线升级；如果服务器上有人改过源码导致历史冲突，它会
 停止，而不是自动合并未知改动。
 
+### 13.1 Phase 9 溯源升级的配置开关
+
+从旧版本升级到任务溯源版本时，`migrate` 会依次应用 `0033`～`0039`：发布者与责任链、
+系统逾期事件、任务说明、说明审计、完成说明关联、返工通知和验收通知。迁移只扩展现有
+SQLite 数据，不会清空原任务，也不会把旧任务伪造成有完成说明的新任务。
+
+先检查 `.env`：
+
+```bash
+grep -E '^LIFECYCLE_(PRIVATE|REVIEW)_WRITES_ENABLED=' .env
+```
+
+正式启用自然语言复核时应为：
+
+```dotenv
+LIFECYCLE_PRIVATE_WRITES_ENABLED=true
+LIFECYCLE_REVIEW_WRITES_ENABLED=true
+```
+
+第二项依赖第一项。若希望先只部署页面和数据库、暂不允许自然语言验收/返工，可以保持
+`LIFECYCLE_REVIEW_WRITES_ENABLED=false`；管理后台复核不受该私聊开关影响。编辑后执行
+`docker compose config --quiet`，不要把 `.env` 提交到 Git。
+
+### 13.2 构建、迁移并切换容器
+
 重新构建并更新容器：
 
 ```bash
 docker compose build
-docker compose up -d --wait --wait-timeout 180
+docker compose up -d --force-recreate --wait --wait-timeout 180
 docker compose ps --all
 curl -fsS http://127.0.0.1:8080/health
 echo
+docker compose exec -T management-api python -m app db-status
+docker compose exec -T management-api python -c '
+import sqlite3
+db = sqlite3.connect("/app/data/feishu_task_agent.db")
+print("schema_version:", db.execute("SELECT version_num FROM alembic_version").fetchone()[0])
+'
 ```
 
-命名卷独立于镜像和容器，正常构建、更新或重建不会删除 SQLite 数据库。
+预期 `migrate` 为 `Exited (0)`，其余服务健康，`schema_version` 为当前仓库最新迁移；本版
+应为 `20260831_0039`。升级前后的非敏感业务计数应保持一致，除非升级期间仍有真实消息
+写入。命名卷独立于镜像和容器，正常构建、更新或重建不会删除 SQLite 数据库。
+
+### 13.3 溯源功能最小验收
+
+1. 负责人给一个测试任务追加 `T-编号 进度：……`，确认状态不变；
+2. 负责人发送带结果说明的 `T-编号 已完成……`，确认进入“已完成、待复核”；
+3. 管理员发送 `T-编号 验收通过`，确认第一条只提示，再发送机器人给出的“确认执行”句；
+4. 后台检查发布者、负责人、实际完成人、复核人、完成周期和统一时间线；
+5. 确认同一接收人没有收到重复通知。
+
+### 13.4 回退边界
+
+- `git pull` 或构建失败、尚未切换容器：旧容器通常仍在运行，修复错误后重试即可；
+- 新容器启动失败但数据库没有业务写入：保留 `$OLD_COMMIT`、旧镜像和备份，使用已验证的
+  旧镜像临时恢复服务；不要执行 `git reset --hard`；
+- 迁移后已经产生新的说明、完成周期、复核或通知记录：不要只降级数据库，也不要把旧
+  SQLite 文件直接覆盖正在运行的命名卷。需要回到旧数据库时必须先停服务，并使用升级前
+  已验证备份按正式灾难恢复流程处理；仓库当前只提供隔离恢复验证，不提供一键覆盖正式卷；
+- 回退应用镜像不会自动回退数据库。`alembic downgrade`、删除表、删除命名卷都不是普通
+  发布回退命令。
 
 升级失败时不要执行 `git reset --hard`、删除数据库或删除命名卷。保留终端错误、旧提交
 编号和最近备份，再按错误制定回退方案。

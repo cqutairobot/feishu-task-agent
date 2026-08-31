@@ -178,6 +178,14 @@ class ManagementTaskCreationServiceTest(unittest.TestCase):
             self.assertEqual(task.confidence, 1.0)
             self.assertEqual(task.owner_open_id, "ou_one")
             self.assertEqual(task.owner_name_snapshot, "王哈")
+            self.assertEqual(task.created_by_open_id, "ou_admin")
+            self.assertEqual(task.created_by_name, "导师")
+            self.assertEqual(task.created_via, "management")
+            self.assertEqual(
+                task.creator_attribution_basis,
+                "explicit_assignment",
+            )
+            self.assertEqual(task.creator_attribution_confidence, 1.0)
             self.assertEqual(task.deadline, deadline)
             event = session.scalar(
                 select(TaskCreationEvent).where(

@@ -65,13 +65,17 @@ class PrivateLifecycleCommandTest(unittest.TestCase):
     def test_successful_completion_uses_owner_scope_and_model_audit(self) -> None:
         candidate = self._candidate(LifecycleAction.COMPLETE)
         self.detector.detect_lifecycle.return_value = self._call(candidate)
-        message = self._message("1A 已经做完并归档了")
+        message = self._message(
+            "T-1A 已完成，结果和日志已经上传实验服务器。"
+        )
 
         result = self._processor().handle(message)
 
         self.assertTrue(result.succeeded)
         self.assertIn("任务已标记完成", result.reply_text)
         self.assertIn("[T-1A] 验收记录", result.reply_text)
+        self.assertIn("完成说明与来源证据已保存", result.reply_text)
+        self.assertIn("等待本群管理员复核", result.reply_text)
         self.tasks.find_lifecycle_target_across_chats.assert_called_once_with(
             1,
             owner_open_id=None,

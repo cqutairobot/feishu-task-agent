@@ -32,6 +32,7 @@ from app.notifications.repository import TaskNotificationRepository
 from app.reminders.repository import ReminderRepository
 from app.tasks.repository import TaskRepository
 from app.tasks.manual_creation import ManagementTaskCreationService
+from app.tasks.notes import TaskNoteService
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,7 @@ class DatabaseRuntime:
     notifications: TaskNotificationRepository
     lifecycle_mutations: LifecycleMutationService
     management_task_creation: ManagementTaskCreationService
+    task_notes: TaskNoteService
     chat_administrators: ChatAdministratorRepository
     management: ManagementReadApi
     management_auth: ManagementAuthRepository
@@ -116,6 +118,7 @@ def open_database_runtime(
             session_factory,
             reminder_settings=reminder_settings,
         ),
+        task_notes=TaskNoteService(session_factory),
         chat_administrators=chat_administrators,
         management=ManagementReadApi(session_factory),
         management_auth=ManagementAuthRepository(

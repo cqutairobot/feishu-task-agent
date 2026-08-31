@@ -1,5 +1,6 @@
 """Strictly-private Feishu task-notification sender tests."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from types import SimpleNamespace
@@ -57,7 +58,7 @@ class TaskNotificationSenderTest(unittest.TestCase):
             ),
             (
                 TaskNotificationKind.TASK_DONE_ADMIN,
-                "任务完成通知",
+                "任务完成待复核",
             ),
             (
                 TaskNotificationKind.TASK_CANCELLED_ADMIN,
@@ -73,7 +74,7 @@ class TaskNotificationSenderTest(unittest.TestCase):
             ),
             (
                 TaskNotificationKind.TASK_DONE_COASSIGNEE,
-                "共同任务状态更新",
+                "共同任务已提交完成",
             ),
             (
                 TaskNotificationKind.TASK_CANCELLED_COASSIGNEE,
@@ -123,6 +124,22 @@ class TaskNotificationSenderTest(unittest.TestCase):
                 TaskNotificationKind.TASK_RESTORED_ADMIN,
                 "管理员恢复任务通知",
             ),
+            (
+                TaskNotificationKind.TASK_REOPENED_COASSIGNEE,
+                "任务已要求返工",
+            ),
+            (
+                TaskNotificationKind.TASK_REOPENED_ADMIN,
+                "任务返工通知",
+            ),
+            (
+                TaskNotificationKind.TASK_ACCEPTED_COASSIGNEE,
+                "任务验收通过",
+            ),
+            (
+                TaskNotificationKind.TASK_ACCEPTED_ADMIN,
+                "任务验收通过通知",
+            ),
         )
         for kind, expected in cases:
             with self.subTest(kind=kind):
@@ -142,6 +159,16 @@ class TaskNotificationSenderTest(unittest.TestCase):
                 self.assertIn("T-1A", text)
                 self.assertIn("完成前端页面", text)
                 self.assertIn("王政", text)
+                if kind in {
+                    TaskNotificationKind.TASK_DONE_ADMIN,
+                    TaskNotificationKind.TASK_DONE_COASSIGNEE,
+                }:
+                    self.assertIn("等待管理员复核", text)
+                if kind in {
+                    TaskNotificationKind.TASK_REOPENED_COASSIGNEE,
+                    TaskNotificationKind.TASK_REOPENED_ADMIN,
+                }:
+                    self.assertIn("当前交付缺少实验日志", text)
 
     def test_missing_deadline_text_uses_the_actual_scheduled_delay(self) -> None:
         cases = (
@@ -190,6 +217,40 @@ class TaskNotificationSenderTest(unittest.TestCase):
         request = client.im.v1.message.create.call_args.args[0]
         self.assertEqual(request.receive_id_type, "open_id")
 
+    def test_delivery_uuid_is_stable_across_retry_attempts(self) -> None:
+        client = MagicMock()
+        client.im.v1.message.create.side_effect = (
+            _success("om_first"),
+            _success("om_same_delivery"),
+        )
+        sender = FeishuTaskNotificationSender(
+            self.settings, client=client
+        )
+        first = self._lease(
+            TaskNotificationKind.TASK_ACCEPTED_COASSIGNEE
+        )
+        retry = replace(
+            first,
+            attempt=2,
+            worker_id="worker-after-restart",
+            lease_expires_at=first.lease_expires_at + timedelta(minutes=2),
+        )
+
+        sender.deliver(first)
+        sender.deliver(retry)
+
+        requests = [
+            call.args[0]
+            for call in client.im.v1.message.create.call_args_list
+        ]
+        self.assertEqual(
+            requests[0].request_body.uuid,
+            requests[1].request_body.uuid,
+        )
+        self.assertTrue(
+            requests[0].request_body.uuid.startswith("notification-")
+        )
+
     def _lease(
         self,
         kind: TaskNotificationKind,
@@ -212,6 +273,7 @@ class TaskNotificationSenderTest(unittest.TestCase):
             deadline_before=datetime(
                 2026, 8, 29, 10, 0, tzinfo=timezone.utc
             ),
+            reason="当前交付缺少实验日志，请补齐后重新提交。",
             task_created_at=self.now - created_delay,
             scheduled_for=self.now,
             attempt=1,

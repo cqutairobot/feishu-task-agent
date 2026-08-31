@@ -32,6 +32,21 @@ from app.lifecycle.contracts import (
     parse_lifecycle_detection_json,
 )
 from app.lifecycle.prompt import build_lifecycle_detection_input
+from app.lifecycle.review_context import ReviewDetectionContext
+from app.lifecycle.review_contracts import (
+    ReviewDetectionResult,
+    ReviewOutputError,
+    parse_review_detection_json,
+    review_detection_json_schema,
+)
+from app.lifecycle.review_prompt import build_review_detection_input
+from app.tasks.note_contracts import (
+    TaskNoteDetectionResult,
+    TaskNoteOutputError,
+    parse_task_note_detection_json,
+    task_note_detection_json_schema,
+)
+from app.tasks.note_prompt import build_task_note_detection_input
 
 
 class ModelProviderError(RuntimeError):
@@ -59,6 +74,24 @@ class TaskBatchDetectionCall:
 @dataclass(frozen=True, slots=True)
 class TaskLifecycleDetectionCall:
     result: LifecycleDetectionResult
+    model: str
+    response_format: str
+    request_id: str | None
+    usage: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReviewDetectionCall:
+    result: ReviewDetectionResult
+    model: str
+    response_format: str
+    request_id: str | None
+    usage: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskNoteDetectionCall:
+    result: TaskNoteDetectionResult
     model: str
     response_format: str
     request_id: str | None
@@ -220,6 +253,91 @@ class OpenAICompatibleTaskDetector:
                 f"模型生命周期输出未通过本地契约校验：{exc}"
             ) from exc
         return TaskLifecycleDetectionCall(
+            result=result,
+            model=self._response_model(payload),
+            response_format=mode,
+            request_id=response.headers.get("x-request-id"),
+            usage=self._usage(payload),
+        )
+
+    def detect_review(
+        self, context: ReviewDetectionContext
+    ) -> TaskReviewDetectionCall:
+        """Detect an accept/reopen intent without applying either action."""
+
+        model_input = build_review_detection_input(context)
+        schema = review_detection_json_schema()
+        response = self._chat_completion(
+            mode="json_schema",
+            schema_name="task_review_action_detection",
+            schema=schema,
+            model_input=model_input,
+            max_tokens=1_200,
+        )
+        mode = "json_schema"
+        if response.status_code in {400, 422}:
+            response = self._chat_completion(
+                mode="json_object",
+                schema_name="task_review_action_detection",
+                schema=schema,
+                model_input=model_input,
+                max_tokens=1_200,
+            )
+            mode = "json_object"
+        if not response.is_success:
+            raise self._http_error(response)
+
+        payload = self._response_json(response)
+        content = self._message_content(payload)
+        try:
+            result = parse_review_detection_json(content, context)
+        except ReviewOutputError as exc:
+            raise ModelProviderError(
+                f"模型复核动作输出未通过本地契约校验：{exc}"
+            ) from exc
+        return TaskReviewDetectionCall(
+            result=result,
+            model=self._response_model(payload),
+            response_format=mode,
+            request_id=response.headers.get("x-request-id"),
+            usage=self._usage(payload),
+        )
+
+    def detect_note(
+        self, context: LifecycleDetectionContext
+    ) -> TaskNoteDetectionCall:
+        """Detect at most one factual task note without changing task state."""
+
+        model_input = build_task_note_detection_input(context)
+        schema = task_note_detection_json_schema()
+        response = self._chat_completion(
+            mode="json_schema",
+            schema_name="task_note_detection",
+            schema=schema,
+            model_input=model_input,
+            max_tokens=1_500,
+        )
+        mode = "json_schema"
+        if response.status_code in {400, 422}:
+            response = self._chat_completion(
+                mode="json_object",
+                schema_name="task_note_detection",
+                schema=schema,
+                model_input=model_input,
+                max_tokens=1_500,
+            )
+            mode = "json_object"
+        if not response.is_success:
+            raise self._http_error(response)
+        payload = self._response_json(response)
+        content = self._message_content(payload)
+        try:
+            result = parse_task_note_detection_json(content, context)
+        except TaskNoteOutputError as exc:
+            raise ModelProviderError(
+                f"模型任务说明输出未通过本地契约校验：{exc}"
+            ) from exc
+        return TaskNoteDetectionCall(
             result=result,
             model=self._response_model(payload),
             response_format=mode,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import json
 from typing import Iterable
 
 from sqlalchemy import func, or_, select
@@ -19,10 +20,12 @@ from app.database.models import (
     Message,
     Task,
     TaskAssignee,
+    TaskCompletionSubmission,
     TaskEvidence,
     TaskLifecycleEvent,
     TaskLifecycleEvidence,
     TaskNotification,
+    TaskNote,
     TaskReminder,
     User,
 )
@@ -106,6 +109,19 @@ class ManagementTaskSnapshot:
     title: str
     description: str
     status: str
+    created_by_open_id: str | None
+    created_by_name: str | None
+    created_via: str
+    creator_attribution_basis: str
+    creator_attribution_confidence: float | None
+    review_status: str
+    reviewed_by_open_id: str | None
+    reviewed_by_name: str | None
+    reviewed_at: datetime | None
+    completion_cycle: int
+    last_completed_by_open_id: str | None
+    last_completed_by_name: str | None
+    last_completed_at: datetime | None
     merged_into_task_id: int | None
     merged_into_task_code: str | None
     deadline: datetime | None
@@ -141,13 +157,21 @@ class ManagementLifecycleSnapshot:
     event_id: int
     action: str
     actor_open_id: str
+    actor_name: str | None
     authorization_role: str
+    trigger_source: str
+    source_message_id: str | None
+    correlation_id: str | None
     previous_status: str
     new_status: str
     deadline_before: datetime | None
     deadline_after: datetime | None
     title_before: str | None
     title_after: str | None
+    from_review_status: str | None
+    to_review_status: str | None
+    reason: str | None
+    completion_cycle: int | None
     confidence: float
     provider: str | None
     model: str | None
@@ -157,9 +181,12 @@ class ManagementLifecycleSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ManagementDeliverySnapshot:
+    delivery_id: int
     delivery_type: str
     kind: str
     recipient_open_id: str
+    source_lifecycle_event_id: int | None
+    reason: str | None
     status: str
     scheduled_for: datetime
     sent_at: datetime | None
@@ -169,11 +196,92 @@ class ManagementDeliverySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ManagementTaskNoteSnapshot:
+    note_id: int
+    author_open_id: str
+    author_name: str
+    note_type: str
+    content: str
+    source_message_id: str | None
+    source_chat_id: str | None
+    completion_cycle: int
+    confidence: float | None
+    provider: str | None
+    model: str | None
+    response_format: str | None
+    model_request_id: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementCompletionSubmissionSnapshot:
+    submission_id: int
+    cycle: int
+    submitted_by_open_id: str
+    submitted_by_name: str
+    source_message_id: str | None
+    completion_note_id: int | None
+    content: str
+    evidence_message_ids: tuple[str, ...]
+    submitted_at: datetime
+    review_status: str
+    reviewed_by_open_id: str | None
+    reviewed_by_name: str | None
+    reviewed_at: datetime | None
+    review_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementResponsibilitySnapshot:
+    publisher_open_id: str | None
+    publisher_name: str | None
+    created_via: str
+    attribution_basis: str
+    attribution_confidence: float | None
+    assignees: tuple[ManagementAssigneeSnapshot, ...]
+    latest_completer_open_id: str | None
+    latest_completer_name: str | None
+    latest_completed_at: datetime | None
+    latest_reviewer_open_id: str | None
+    latest_reviewer_name: str | None
+    latest_reviewed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementProvenanceTimelineSnapshot:
+    event_type: str
+    event_id: str
+    occurred_at: datetime
+    action: str
+    actor_open_id: str | None
+    actor_name: str | None
+    completion_cycle: int | None
+    content: str | None
+    reason: str | None
+    source_message_id: str | None
+    evidence_message_ids: tuple[str, ...]
+    previous_status: str | None
+    new_status: str | None
+    from_review_status: str | None
+    to_review_status: str | None
+    delivery_type: str | None
+    recipient_open_id: str | None
+    delivery_status: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ManagementTaskDetail:
     task: ManagementTaskSnapshot
+    responsibility: ManagementResponsibilitySnapshot
     evidence: tuple[ManagementEvidenceSnapshot, ...]
     lifecycle: tuple[ManagementLifecycleSnapshot, ...]
+    notes: tuple[ManagementTaskNoteSnapshot, ...]
+    completion_submissions: tuple[ManagementCompletionSubmissionSnapshot, ...]
     deliveries: tuple[ManagementDeliverySnapshot, ...]
+    timeline: tuple[ManagementProvenanceTimelineSnapshot, ...]
 
 
 class ManagementReadApi:
@@ -457,11 +565,28 @@ class ManagementReadApi:
             )
             if task is None:
                 raise ManagementQueryError("task does not exist in this chat")
+            task_snapshot = _task_snapshot(task)
+            evidence = _task_evidence(session, task.id)
+            lifecycle = _task_lifecycle(session, task.id)
+            notes = _task_notes(session, task.id)
+            submissions = _task_completion_submissions(session, task.id)
+            deliveries = _task_deliveries(session, task.id)
             return ManagementTaskDetail(
-                task=_task_snapshot(task),
-                evidence=_task_evidence(session, task.id),
-                lifecycle=_task_lifecycle(session, task.id),
-                deliveries=_task_deliveries(session, task.id),
+                task=task_snapshot,
+                responsibility=_task_responsibility(task_snapshot),
+                evidence=evidence,
+                lifecycle=lifecycle,
+                notes=notes,
+                completion_submissions=submissions,
+                deliveries=deliveries,
+                timeline=_task_timeline(
+                    task_snapshot,
+                    evidence=evidence,
+                    lifecycle=lifecycle,
+                    notes=notes,
+                    submissions=submissions,
+                    deliveries=deliveries,
+                ),
             )
 
     @staticmethod
@@ -543,6 +668,19 @@ def _task_snapshot(task: Task) -> ManagementTaskSnapshot:
         title=task.title,
         description=task.description,
         status="merged" if task.merged_into_task_id is not None else task.status,
+        created_by_open_id=task.created_by_open_id,
+        created_by_name=task.created_by_name,
+        created_via=task.created_via,
+        creator_attribution_basis=task.creator_attribution_basis,
+        creator_attribution_confidence=task.creator_attribution_confidence,
+        review_status=task.review_status,
+        reviewed_by_open_id=task.reviewed_by_open_id,
+        reviewed_by_name=task.reviewed_by_name,
+        reviewed_at=task.reviewed_at,
+        completion_cycle=task.completion_cycle,
+        last_completed_by_open_id=task.last_completed_by_open_id,
+        last_completed_by_name=task.last_completed_by_name,
+        last_completed_at=task.last_completed_at,
         merged_into_task_id=task.merged_into_task_id,
         merged_into_task_code=(
             format_task_code(task.merged_into_task_id)
@@ -609,13 +747,21 @@ def _task_lifecycle(
                 event_id=event.id,
                 action=event.action,
                 actor_open_id=event.actor_open_id,
+                actor_name=event.actor_name_snapshot,
                 authorization_role=event.authorization_role,
+                trigger_source=event.trigger_source,
+                source_message_id=event.source_message_id,
+                correlation_id=event.correlation_id,
                 previous_status=event.previous_status,
                 new_status=event.new_status,
                 deadline_before=event.deadline_before,
                 deadline_after=event.deadline_after,
                 title_before=event.title_before,
                 title_after=event.title_after,
+                from_review_status=event.from_review_status,
+                to_review_status=event.to_review_status,
+                reason=event.reason,
+                completion_cycle=event.completion_cycle,
                 confidence=event.confidence,
                 provider=event.provider,
                 model=event.model,
@@ -624,6 +770,126 @@ def _task_lifecycle(
             )
         )
     return tuple(snapshots)
+
+
+def _task_notes(
+    session: Session, task_id: int
+) -> tuple[ManagementTaskNoteSnapshot, ...]:
+    notes = session.scalars(
+        select(TaskNote)
+        .where(TaskNote.task_id == task_id)
+        .order_by(TaskNote.created_at, TaskNote.id)
+    )
+    return tuple(
+        ManagementTaskNoteSnapshot(
+            note_id=note.id,
+            author_open_id=note.author_open_id,
+            author_name=note.author_name_snapshot,
+            note_type=note.note_type,
+            content=note.content,
+            source_message_id=note.source_message_id,
+            source_chat_id=note.source_chat_id,
+            completion_cycle=note.completion_cycle,
+            confidence=note.confidence,
+            provider=note.provider,
+            model=note.model,
+            response_format=note.response_format,
+            model_request_id=note.model_request_id,
+            prompt_tokens=note.prompt_tokens,
+            completion_tokens=note.completion_tokens,
+            total_tokens=note.total_tokens,
+            created_at=note.created_at,
+        )
+        for note in notes
+    )
+
+
+def _task_responsibility(
+    task: ManagementTaskSnapshot,
+) -> ManagementResponsibilitySnapshot:
+    return ManagementResponsibilitySnapshot(
+        publisher_open_id=task.created_by_open_id,
+        publisher_name=task.created_by_name,
+        created_via=task.created_via,
+        attribution_basis=task.creator_attribution_basis,
+        attribution_confidence=task.creator_attribution_confidence,
+        assignees=task.assignees,
+        latest_completer_open_id=task.last_completed_by_open_id,
+        latest_completer_name=task.last_completed_by_name,
+        latest_completed_at=task.last_completed_at,
+        latest_reviewer_open_id=task.reviewed_by_open_id,
+        latest_reviewer_name=task.reviewed_by_name,
+        latest_reviewed_at=task.reviewed_at,
+    )
+
+
+def _task_completion_submissions(
+    session: Session, task_id: int
+) -> tuple[ManagementCompletionSubmissionSnapshot, ...]:
+    submissions = tuple(
+        session.scalars(
+            select(TaskCompletionSubmission)
+            .where(TaskCompletionSubmission.task_id == task_id)
+            .order_by(
+                TaskCompletionSubmission.cycle,
+                TaskCompletionSubmission.submitted_at,
+                TaskCompletionSubmission.id,
+            )
+        )
+    )
+    review_events = tuple(
+        session.scalars(
+            select(TaskLifecycleEvent)
+            .where(
+                TaskLifecycleEvent.task_id == task_id,
+                TaskLifecycleEvent.action.in_(("accept", "reopen")),
+            )
+            .order_by(
+                TaskLifecycleEvent.applied_at,
+                TaskLifecycleEvent.id,
+            )
+        )
+    )
+    reviewer_snapshots = {
+        (event.completion_cycle, event.actor_open_id): event.actor_name_snapshot
+        for event in review_events
+        if event.completion_cycle is not None
+    }
+    result: list[ManagementCompletionSubmissionSnapshot] = []
+    for submission in submissions:
+        reviewer_name = None
+        if submission.reviewed_by_open_id is not None:
+            reviewer_name = reviewer_snapshots.get(
+                (submission.cycle, submission.reviewed_by_open_id)
+            )
+            if reviewer_name is None:
+                reviewer_name = session.scalar(
+                    select(User.name).where(
+                        User.open_id == submission.reviewed_by_open_id
+                    )
+                )
+            reviewer_name = reviewer_name or submission.reviewed_by_open_id
+        result.append(
+            ManagementCompletionSubmissionSnapshot(
+                submission_id=submission.id,
+                cycle=submission.cycle,
+                submitted_by_open_id=submission.submitted_by_open_id,
+                submitted_by_name=submission.submitted_by_name_snapshot,
+                source_message_id=submission.source_message_id,
+                completion_note_id=submission.completion_note_id,
+                content=submission.content_snapshot,
+                evidence_message_ids=_message_id_tuple(
+                    submission.evidence_json
+                ),
+                submitted_at=submission.submitted_at,
+                review_status=submission.review_status,
+                reviewed_by_open_id=submission.reviewed_by_open_id,
+                reviewed_by_name=reviewer_name,
+                reviewed_at=submission.reviewed_at,
+                review_reason=submission.review_reason,
+            )
+        )
+    return tuple(result)
 
 
 def _task_deliveries(
@@ -641,9 +907,12 @@ def _task_deliveries(
     )
     result = [
         ManagementDeliverySnapshot(
+            delivery_id=item.id,
             delivery_type="reminder",
             kind=item.kind,
             recipient_open_id=item.recipient_open_id,
+            source_lifecycle_event_id=None,
+            reason=None,
             status=item.status,
             scheduled_for=item.scheduled_for,
             sent_at=item.sent_at,
@@ -655,9 +924,12 @@ def _task_deliveries(
     ]
     result.extend(
         ManagementDeliverySnapshot(
+            delivery_id=item.id,
             delivery_type="notification",
             kind=item.kind,
             recipient_open_id=item.recipient_open_id,
+            source_lifecycle_event_id=item.source_lifecycle_event_id,
+            reason=item.reason_snapshot,
             status=item.status,
             scheduled_for=item.scheduled_for,
             sent_at=item.sent_at,
@@ -668,7 +940,186 @@ def _task_deliveries(
         for item in notifications
     )
     return tuple(
-        sorted(result, key=lambda item: (item.scheduled_for, item.delivery_type))
+        sorted(
+            result,
+            key=lambda item: (
+                item.scheduled_for,
+                item.delivery_type,
+                item.delivery_id,
+            ),
+        )
+    )
+
+
+def _task_timeline(
+    task: ManagementTaskSnapshot,
+    *,
+    evidence: tuple[ManagementEvidenceSnapshot, ...],
+    lifecycle: tuple[ManagementLifecycleSnapshot, ...],
+    notes: tuple[ManagementTaskNoteSnapshot, ...],
+    submissions: tuple[ManagementCompletionSubmissionSnapshot, ...],
+    deliveries: tuple[ManagementDeliverySnapshot, ...],
+) -> tuple[ManagementProvenanceTimelineSnapshot, ...]:
+    items = [
+        ManagementProvenanceTimelineSnapshot(
+            event_type="created",
+            event_id=f"task:{task.task_id}:created",
+            occurred_at=task.created_at,
+            action="create",
+            actor_open_id=task.created_by_open_id,
+            actor_name=task.created_by_name,
+            completion_cycle=0,
+            content=task.title,
+            reason=None,
+            source_message_id=(
+                evidence[0].message_id if evidence else None
+            ),
+            evidence_message_ids=tuple(
+                item.message_id for item in evidence
+            ),
+            previous_status=None,
+            new_status=None,
+            from_review_status=None,
+            to_review_status=None,
+            delivery_type=None,
+            recipient_open_id=None,
+            delivery_status=None,
+        )
+    ]
+    items.extend(
+        ManagementProvenanceTimelineSnapshot(
+            event_type="lifecycle",
+            event_id=f"lifecycle:{event.event_id}",
+            occurred_at=event.applied_at,
+            action=event.action,
+            actor_open_id=event.actor_open_id,
+            actor_name=event.actor_name,
+            completion_cycle=event.completion_cycle,
+            content=event.title_after,
+            reason=event.reason,
+            source_message_id=event.source_message_id,
+            evidence_message_ids=event.evidence_message_ids,
+            previous_status=event.previous_status,
+            new_status=event.new_status,
+            from_review_status=event.from_review_status,
+            to_review_status=event.to_review_status,
+            delivery_type=None,
+            recipient_open_id=None,
+            delivery_status=None,
+        )
+        for event in lifecycle
+    )
+    items.extend(
+        ManagementProvenanceTimelineSnapshot(
+            event_type="note",
+            event_id=f"note:{note.note_id}",
+            occurred_at=note.created_at,
+            action=note.note_type,
+            actor_open_id=note.author_open_id,
+            actor_name=note.author_name,
+            completion_cycle=note.completion_cycle,
+            content=note.content,
+            reason=None,
+            source_message_id=note.source_message_id,
+            evidence_message_ids=(
+                (note.source_message_id,)
+                if note.source_message_id is not None
+                else ()
+            ),
+            previous_status=None,
+            new_status=None,
+            from_review_status=None,
+            to_review_status=None,
+            delivery_type=None,
+            recipient_open_id=None,
+            delivery_status=None,
+        )
+        for note in notes
+    )
+    items.extend(
+        ManagementProvenanceTimelineSnapshot(
+            event_type="completion_submission",
+            event_id=f"completion:{submission.submission_id}",
+            occurred_at=submission.submitted_at,
+            action="submit_completion",
+            actor_open_id=submission.submitted_by_open_id,
+            actor_name=submission.submitted_by_name,
+            completion_cycle=submission.cycle,
+            content=submission.content,
+            reason=submission.review_reason,
+            source_message_id=submission.source_message_id,
+            evidence_message_ids=submission.evidence_message_ids,
+            previous_status=None,
+            new_status="done",
+            from_review_status=None,
+            to_review_status=submission.review_status,
+            delivery_type=None,
+            recipient_open_id=None,
+            delivery_status=None,
+        )
+        for submission in submissions
+    )
+    items.extend(
+        ManagementProvenanceTimelineSnapshot(
+            event_type="delivery",
+            event_id=(
+                f"delivery:{delivery.delivery_type}:{delivery.delivery_id}"
+            ),
+            occurred_at=(
+                delivery.sent_at
+                or delivery.cancelled_at
+                or delivery.scheduled_for
+            ),
+            action=delivery.kind,
+            actor_open_id=None,
+            actor_name=None,
+            completion_cycle=None,
+            content=None,
+            reason=delivery.reason or delivery.cancel_reason,
+            source_message_id=None,
+            evidence_message_ids=(),
+            previous_status=None,
+            new_status=None,
+            from_review_status=None,
+            to_review_status=None,
+            delivery_type=delivery.delivery_type,
+            recipient_open_id=delivery.recipient_open_id,
+            delivery_status=delivery.status,
+        )
+        for delivery in deliveries
+    )
+    event_type_order = {
+        "created": 0,
+        "note": 1,
+        "completion_submission": 2,
+        "lifecycle": 3,
+        "delivery": 4,
+    }
+    return tuple(
+        sorted(
+            items,
+            key=lambda item: (
+                item.occurred_at,
+                event_type_order[item.event_type],
+                item.event_id,
+            ),
+        )
+    )
+
+
+def _message_id_tuple(raw_value: str) -> tuple[str, ...]:
+    try:
+        value = json.loads(raw_value)
+    except (json.JSONDecodeError, TypeError):
+        return ()
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
     )
 
 

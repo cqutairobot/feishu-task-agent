@@ -279,6 +279,129 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
         self.assertEqual(row.kind, TaskNotificationKind.TASK_DONE_ADMIN.value)
         self.assertEqual(row.recipient_open_id, "ou_other_admin")
 
+    def test_lifecycle_administrator_recipients_are_isolated_by_chat(self) -> None:
+        with session_scope(self.session_factory) as session:
+            session.add(
+                Chat(
+                    chat_id="oc_other",
+                    tenant_key="tenant",
+                    name="另一个测试群",
+                    chat_type="group",
+                )
+            )
+            session.add_all(
+                (
+                    ChatAdministrator(
+                        chat_id="oc_group",
+                        open_id="ou_admin",
+                        granted_by_open_id=None,
+                        source="bootstrap",
+                        created_at=self.now,
+                    ),
+                    ChatAdministrator(
+                        chat_id="oc_other",
+                        open_id="ou_other_admin",
+                        granted_by_open_id=None,
+                        source="bootstrap",
+                        created_at=self.now,
+                    ),
+                )
+            )
+        first_task_id = self._task(
+            deadline=self.now + timedelta(days=1),
+            chat_id="oc_group",
+        )
+        other_task_id = self._task(
+            deadline=self.now + timedelta(days=1),
+            chat_id="oc_other",
+        )
+        self._lifecycle_event(
+            first_task_id, action="complete", actor="ou_owner"
+        )
+        self._lifecycle_event(
+            other_task_id, action="complete", actor="ou_owner"
+        )
+        repository = TaskNotificationRepository(
+            self.session_factory,
+            administrator_open_ids=frozenset(),
+            allowed_chat_ids=frozenset({"oc_group", "oc_other"}),
+            settings=ReminderSettings(),
+        )
+
+        result = repository.sync_all(synced_at=self.now)
+
+        self.assertEqual(result.created, 2)
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(TaskNotification).order_by(TaskNotification.task_id)
+            ).all()
+        self.assertEqual(
+            {(row.task_id, row.recipient_open_id) for row in rows},
+            {
+                (first_task_id, "ou_admin"),
+                (other_task_id, "ou_other_admin"),
+            },
+        )
+
+    def test_revoked_chat_cancels_pending_member_notification_before_claim(
+        self,
+    ) -> None:
+        with session_scope(self.session_factory) as session:
+            session.add(
+                ChatAdministrator(
+                    chat_id="oc_group",
+                    open_id="ou_admin",
+                    granted_by_open_id=None,
+                    source="bootstrap",
+                    created_at=self.now,
+                )
+            )
+        task_id = self._task(deadline=self.now + timedelta(days=1))
+        self._lifecycle_event(
+            task_id, action="complete", actor="ou_admin"
+        )
+        repository = TaskNotificationRepository(
+            self.session_factory,
+            administrator_open_ids=frozenset(),
+            allowed_chat_ids=frozenset({"oc_static"}),
+            settings=ReminderSettings(),
+        )
+
+        admitted = repository.sync_all(synced_at=self.now)
+        with session_scope(self.session_factory) as session:
+            membership = session.scalar(
+                select(ChatAdministrator).where(
+                    ChatAdministrator.chat_id == "oc_group",
+                    ChatAdministrator.open_id == "ou_admin",
+                )
+            )
+            assert membership is not None
+            session.delete(membership)
+        revoked = repository.sync_all(
+            synced_at=self.now + timedelta(seconds=1)
+        )
+        lease = repository.claim_due(
+            "worker-after-revocation",
+            claimed_at=self.now + timedelta(seconds=2),
+        )
+
+        self.assertEqual(admitted.created, 1)
+        self.assertEqual(revoked.cancelled, 1)
+        self.assertIsNone(lease)
+        with session_scope(self.session_factory) as session:
+            row = session.scalar(
+                select(TaskNotification).where(
+                    TaskNotification.task_id == task_id
+                )
+            )
+        assert row is not None
+        self.assertEqual(
+            row.kind,
+            TaskNotificationKind.TASK_DONE_COASSIGNEE.value,
+        )
+        self.assertEqual(row.status, TaskNotificationStatus.CANCELLED.value)
+        self.assertEqual(row.cancel_reason, "task_outside_allowlist")
+
     def test_chat_policy_replans_switches_and_reactivates_without_duplicates(
         self,
     ) -> None:
@@ -567,6 +690,99 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
         replay = self._repository(
             admins=frozenset({"ou_admin", "ou_other_admin"})
         ).sync_all(synced_at=self.now + timedelta(minutes=1))
+        self.assertEqual(replay.created, 0)
+
+    def test_reopen_event_notifies_owner_and_other_administrator_with_reason(
+        self,
+    ) -> None:
+        task_id = self._task(
+            deadline=self.now + timedelta(days=1), status="done"
+        )
+        reason = "当前交付缺少实验日志，请补齐后重新提交。"
+        self._lifecycle_event(
+            task_id,
+            action="reopen",
+            actor="ou_admin",
+            reason=reason,
+        )
+
+        result = self._repository(
+            admins=frozenset({"ou_admin", "ou_other_admin"})
+        ).sync_all(synced_at=self.now)
+
+        self.assertEqual(result.created, 2)
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(TaskNotification).order_by(TaskNotification.id)
+            ).all()
+        self.assertEqual(
+            {(row.kind, row.recipient_open_id) for row in rows},
+            {
+                (
+                    TaskNotificationKind.TASK_REOPENED_COASSIGNEE.value,
+                    "ou_owner",
+                ),
+                (
+                    TaskNotificationKind.TASK_REOPENED_ADMIN.value,
+                    "ou_other_admin",
+                ),
+            },
+        )
+        self.assertTrue(all(row.reason_snapshot == reason for row in rows))
+        self.assertTrue(
+            all(row.owner_name_snapshot == "王政" for row in rows)
+        )
+        self.assertNotIn(
+            "管理员",
+            {row.owner_name_snapshot for row in rows},
+        )
+        replay = self._repository(
+            admins=frozenset({"ou_admin", "ou_other_admin"})
+        ).sync_all(synced_at=self.now + timedelta(minutes=1))
+        self.assertEqual(replay.created, 0)
+
+    def test_accept_event_notifies_owner_and_other_administrator_once(self) -> None:
+        task_id = self._task(
+            deadline=self.now + timedelta(days=1), status="done"
+        )
+        self._lifecycle_event(task_id, action="accept", actor="ou_admin")
+
+        repository = self._repository(
+            admins=frozenset({"ou_admin", "ou_other_admin"})
+        )
+        result = repository.sync_all(synced_at=self.now)
+
+        self.assertEqual(result.created, 2)
+        with session_scope(self.session_factory) as session:
+            rows = session.scalars(
+                select(TaskNotification).order_by(TaskNotification.id)
+            ).all()
+        by_recipient = {row.recipient_open_id: row for row in rows}
+        self.assertEqual(
+            {
+                (row.kind, row.recipient_open_id) for row in rows
+            },
+            {
+                (
+                    TaskNotificationKind.TASK_ACCEPTED_COASSIGNEE.value,
+                    "ou_owner",
+                ),
+                (
+                    TaskNotificationKind.TASK_ACCEPTED_ADMIN.value,
+                    "ou_other_admin",
+                ),
+            },
+        )
+        self.assertEqual(
+            by_recipient["ou_owner"].owner_name_snapshot,
+            "导师",
+        )
+        self.assertEqual(
+            by_recipient["ou_other_admin"].owner_name_snapshot,
+            "王政",
+        )
+
+        replay = repository.sync_all(synced_at=self.now + timedelta(minutes=1))
         self.assertEqual(replay.created, 0)
 
     def test_merge_event_skips_notice_but_advances_lifecycle_cursor(self) -> None:
@@ -936,6 +1152,100 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
             self.assertEqual(row.status, "cancelled")
             self.assertEqual(row.cancel_reason, "task_no_longer_overdue")
 
+    def test_expired_lease_is_recovered_and_rejects_stale_worker_audit(
+        self,
+    ) -> None:
+        task_id = self._task(deadline=None, status="todo")
+        repository = self._repository(test_mode=True)
+        repository.sync_all(synced_at=self.now)
+        due_at = self.now + timedelta(minutes=2)
+
+        first = repository.claim_due(
+            "worker-one",
+            claimed_at=due_at,
+            lease_duration=timedelta(seconds=10),
+        )
+        assert first is not None
+        not_yet_recovered = repository.claim_due(
+            "worker-two",
+            claimed_at=due_at + timedelta(seconds=9),
+            lease_duration=timedelta(seconds=10),
+            notification_id=first.notification_id,
+        )
+        recovered = repository.claim_due(
+            "worker-two",
+            claimed_at=due_at + timedelta(seconds=11),
+            lease_duration=timedelta(seconds=10),
+            notification_id=first.notification_id,
+        )
+
+        self.assertIsNone(not_yet_recovered)
+        assert recovered is not None
+        self.assertEqual(recovered.attempt, 2)
+        self.assertEqual(recovered.worker_id, "worker-two")
+        with self.assertRaisesRegex(ValueError, "no longer active"):
+            repository.mark_sent(
+                first,
+                feishu_message_id="om_stale",
+                receive_id_type="open_id",
+                receive_id="ou_owner",
+                sent_at=due_at + timedelta(seconds=12),
+            )
+
+        repository.mark_sent(
+            recovered,
+            feishu_message_id="om_recovered",
+            receive_id_type="open_id",
+            receive_id="ou_owner",
+            sent_at=due_at + timedelta(seconds=12),
+        )
+        with session_scope(self.session_factory) as session:
+            row = session.get(TaskNotification, recovered.notification_id)
+            assert row is not None
+            self.assertEqual(row.task_id, task_id)
+            self.assertEqual(row.status, TaskNotificationStatus.SENT.value)
+            self.assertEqual(row.attempt_count, 2)
+            self.assertEqual(row.feishu_message_id, "om_recovered")
+            self.assertIsNone(row.last_error_code)
+
+    def test_failed_missing_deadline_delivery_preserves_retry_backoff(self) -> None:
+        self._task(deadline=None, status="todo")
+        repository = self._repository(test_mode=True)
+        repository.sync_all(synced_at=self.now)
+        due_at = self.now + timedelta(minutes=2)
+        first = repository.claim_due(
+            "worker-one",
+            claimed_at=due_at,
+            lease_duration=timedelta(seconds=10),
+        )
+        assert first is not None
+        failure = repository.fail(
+            first,
+            error_code="transport_error",
+            error_message="temporary network failure",
+            failed_at=due_at + timedelta(seconds=1),
+            retry_delay=timedelta(seconds=30),
+        )
+
+        early = repository.claim_due(
+            "worker-two",
+            claimed_at=due_at + timedelta(seconds=2),
+            notification_id=first.notification_id,
+        )
+        retry = repository.claim_due(
+            "worker-two",
+            claimed_at=due_at + timedelta(seconds=31),
+            notification_id=first.notification_id,
+        )
+
+        self.assertEqual(
+            failure.retry_at,
+            due_at + timedelta(seconds=31),
+        )
+        self.assertIsNone(early)
+        assert retry is not None
+        self.assertEqual(retry.attempt, 2)
+
     def _repository(
         self,
         *,
@@ -954,14 +1264,15 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
         *,
         deadline: datetime | None,
         status: str = "todo",
+        chat_id: str = "oc_group",
     ) -> int:
         with session_scope(self.session_factory) as session:
             task = Task(
-                chat_id="oc_group",
+                chat_id=chat_id,
                 owner_open_id="ou_owner",
                 owner_name_snapshot="王政",
-                title=f"测试任务 {deadline} {status}",
-                normalized_title=f"测试任务 {deadline} {status}",
+                title=f"测试任务 {chat_id} {deadline} {status}",
+                normalized_title=f"测试任务 {chat_id} {deadline} {status}",
                 description="验证通知",
                 deadline=deadline,
                 status=status,
@@ -982,6 +1293,7 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
         action: str,
         actor: str,
         new_deadline: datetime | None = None,
+        reason: str | None = None,
     ) -> None:
         with session_scope(self.session_factory) as session:
             task = session.get(Task, task_id)
@@ -998,6 +1310,12 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
                     if task.deadline is not None and task.deadline <= self.now
                     else "todo"
                 ),
+                "reopen": (
+                    "overdue"
+                    if task.deadline is not None and task.deadline <= self.now
+                    else "todo"
+                ),
+                "accept": "done",
             }[action]
             task.status = new_status
             task.completed_at = self.now if new_status == "done" else None
@@ -1024,6 +1342,7 @@ class TaskNotificationRepositoryTest(unittest.TestCase):
                 new_status=new_status,
                 deadline_before=deadline_before,
                 deadline_after=task.deadline,
+                reason=reason,
                 confidence=1.0,
                 applied_at=self.now,
                 created_at=self.now,

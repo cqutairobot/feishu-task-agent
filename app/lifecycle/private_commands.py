@@ -258,6 +258,8 @@ def _success_reply(
             "当前负责人："
             + "、".join(owner.name for owner in mutation.assignees_after)
         )
+    if mutation.action.value == "complete":
+        lines.append("完成说明与来源证据已保存，当前等待本群管理员复核。")
     lines.append(
         "当前状态："
         + {

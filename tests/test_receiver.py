@@ -21,6 +21,10 @@ from app.lifecycle.private_commands import (
     PrivateLifecycleCommandKind,
     PrivateLifecycleCommandResult,
 )
+from app.lifecycle.review_commands import (
+    PrivateReviewCommandKind,
+    PrivateReviewCommandResult,
+)
 from app.tasks.commands import TaskCommandKind, TaskCommandResult
 from app.tasks.card_actions import TaskCardActionResult
 from tests.test_messages import TEXT_EVENT
@@ -470,6 +474,56 @@ class ReceiverCallbackTest(unittest.TestCase):
         )
         lifecycle_commands.handle.assert_called_once()
         replier.reply_text.assert_called_once_with("om_test", "任务已完成")
+
+    def test_read_only_review_processor_runs_before_lifecycle_processor(self) -> None:
+        payload = deepcopy(TEXT_EVENT)
+        payload["event"]["message"]["chat_id"] = "oc_direct"
+        payload["event"]["message"]["chat_type"] = "p2p"
+        payload["event"]["message"]["content"] = json.dumps(
+            {"text": "T-1A 重新开启，原因是缺少回滚步骤"},
+            ensure_ascii=False,
+        )
+        sdk_event = lark.JSON.unmarshal(
+            json.dumps(payload), P2ImMessageReceiveV1
+        )
+        ingestion = Mock()
+        ingestion.process_message.return_value = SimpleNamespace(
+            persistence=SimpleNamespace(status="inserted", inserted=True)
+        )
+        lifecycle_commands = Mock()
+        lifecycle_commands.matches.return_value = True
+        lifecycle_commands.handle.return_value = PrivateLifecycleCommandResult(
+            kind=PrivateLifecycleCommandKind.UPDATE,
+            succeeded=False,
+            reply_text="旧生命周期回复",
+        )
+        review_commands = Mock()
+        review_commands.matches.return_value = True
+        review_commands.handle.return_value = PrivateReviewCommandResult(
+            kind=PrivateReviewCommandKind.DETECT,
+            succeeded=True,
+            reply_text="只读识别成功，任务未修改",
+        )
+        replier = Mock()
+
+        with redirect_stdout(io.StringIO()):
+            _on_message(
+                sdk_event,
+                frozenset({"oc_group"}),
+                ingestion_service=ingestion,
+                message_replier=replier,
+                lifecycle_commands=lifecycle_commands,
+                review_commands=review_commands,
+            )
+
+        self.assertFalse(
+            ingestion.process_message.call_args.kwargs["enqueue_detection"]
+        )
+        review_commands.handle.assert_called_once()
+        lifecycle_commands.handle.assert_not_called()
+        replier.reply_text.assert_called_once_with(
+            "om_test", "只读识别成功，任务未修改"
+        )
 
 
 if __name__ == "__main__":

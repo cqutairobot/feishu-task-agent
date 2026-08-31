@@ -594,6 +594,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         lifecycle_detector = None
         lifecycle_commands = None
+        note_commands = None
+        review_commands = None
         management_commands = None
         card_actions = None
         if settings.task_card_actions_enabled:
@@ -616,25 +618,59 @@ def main(argv: list[str] | None = None) -> int:
             from app.lifecycle.private_commands import (
                 PrivateLifecycleCommandProcessor,
             )
+            from app.lifecycle.review_commands import (
+                PrivateReviewCommandProcessor,
+            )
+            from app.lifecycle.review_context import (
+                PrivateReviewDetectionContextBuilder,
+            )
+            from app.tasks.note_commands import PrivateTaskNoteCommandProcessor
 
             lifecycle_detector = OpenAICompatibleTaskDetector(
                 lifecycle_llm_settings
             )
-            lifecycle_commands = PrivateLifecycleCommandProcessor(
-                runtime.tasks,
-                PrivateLifecycleDetectionContextBuilder(
-                    TaskDetectionContextBuilder(
-                        runtime.repository,
-                        runtime.aliases,
-                    ),
+            private_context_builder = PrivateLifecycleDetectionContextBuilder(
+                TaskDetectionContextBuilder(
+                    runtime.repository,
                     runtime.aliases,
                 ),
+                runtime.aliases,
+            )
+            lifecycle_commands = PrivateLifecycleCommandProcessor(
+                runtime.tasks,
+                private_context_builder,
                 lifecycle_detector,
                 runtime.lifecycle_mutations,
                 administrator_open_ids=settings.task_admin_open_ids,
                 allowed_chat_ids=settings.allowed_chat_ids,
                 context_limit=lifecycle_settings.context_limit,
                 chat_administrators=chat_administrators,
+            )
+            note_commands = PrivateTaskNoteCommandProcessor(
+                runtime.tasks,
+                private_context_builder,
+                lifecycle_detector,
+                runtime.task_notes,
+                administrator_open_ids=settings.task_admin_open_ids,
+                allowed_chat_ids=settings.allowed_chat_ids,
+                context_limit=lifecycle_settings.context_limit,
+                chat_administrators=chat_administrators,
+            )
+            review_commands = PrivateReviewCommandProcessor(
+                runtime.tasks,
+                PrivateReviewDetectionContextBuilder(
+                    TaskDetectionContextBuilder(
+                        runtime.repository,
+                        runtime.aliases,
+                    )
+                ),
+                lifecycle_detector,
+                administrator_open_ids=settings.task_admin_open_ids,
+                allowed_chat_ids=settings.allowed_chat_ids,
+                context_limit=lifecycle_settings.context_limit,
+                chat_administrators=chat_administrators,
+                mutations=runtime.lifecycle_mutations,
+                review_writes_enabled=lifecycle_settings.review_writes_enabled,
             )
         management_auth = getattr(runtime, "management_auth", None)
         if management_web_settings.enabled and management_auth is not None:
@@ -655,6 +691,8 @@ def main(argv: list[str] | None = None) -> int:
                 card_actions,
                 chat_administrators,
                 management_commands,
+                note_commands,
+                review_commands,
             )
         except KeyboardInterrupt:
             print("\nFeishu listener stopped.")
@@ -832,6 +870,7 @@ def _run_management_server() -> int:
                     runtime.chat_administrators,
                     runtime.lifecycle_mutations,
                     runtime.management_task_creation,
+                    runtime.task_notes,
                     runtime.chat_settings,
                     directory.refresh_strict,
                 )

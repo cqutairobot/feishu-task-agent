@@ -281,6 +281,7 @@ class LifecycleSettingsTest(unittest.TestCase):
         settings = LifecycleSettings.from_mapping({})
 
         self.assertFalse(settings.private_writes_enabled)
+        self.assertFalse(settings.review_writes_enabled)
         self.assertEqual(settings.context_limit, 20)
         self.assertEqual(settings.minimum_confidence, 0.9)
 
@@ -288,17 +289,25 @@ class LifecycleSettingsTest(unittest.TestCase):
         settings = LifecycleSettings.from_mapping(
             {
                 "LIFECYCLE_PRIVATE_WRITES_ENABLED": "true",
+                "LIFECYCLE_REVIEW_WRITES_ENABLED": "true",
                 "LIFECYCLE_PRIVATE_CONTEXT_LIMIT": "12",
                 "LIFECYCLE_MUTATION_MIN_CONFIDENCE": "0.95",
             }
         )
         self.assertTrue(settings.private_writes_enabled)
+        self.assertTrue(settings.review_writes_enabled)
         self.assertEqual(settings.context_limit, 12)
         self.assertEqual(settings.minimum_confidence, 0.95)
 
         with self.assertRaisesRegex(SettingsError, "true or false"):
             LifecycleSettings.from_mapping(
                 {"LIFECYCLE_PRIVATE_WRITES_ENABLED": "yes"}
+            )
+        with self.assertRaisesRegex(SettingsError, "requires"):
+            LifecycleSettings.from_mapping(
+                {
+                    "LIFECYCLE_REVIEW_WRITES_ENABLED": "true",
+                }
             )
         with self.assertRaisesRegex(SettingsError, "between 0 and 1"):
             LifecycleSettings.from_mapping(

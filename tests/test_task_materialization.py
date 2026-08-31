@@ -7,13 +7,24 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import DatabaseSettings, TaskSettings
-from app.database.models import TaskNotification
+from app.database.models import (
+    ChatMembership,
+    Task,
+    TaskCompletionSubmission,
+    TaskLifecycleEvent,
+    TaskNote,
+    TaskNotification,
+    TaskReminder,
+)
 from app.database.runtime import open_database_runtime
+from app.lifecycle.contracts import LifecycleAction, LifecycleCandidate
 from app.notifications.repository import TaskNotificationKind
+from app.tasks.codes import format_task_code
+from app.tasks.notes import TaskNoteType, build_task_note_idempotency_key
 from app.tasks.repository import TaskMaterializationError, TaskStatus
 from tests.test_messages import TEXT_EVENT
 
@@ -29,6 +40,7 @@ class TaskMaterializationTest(unittest.TestCase):
                 url=f"sqlite:///{database_path}", echo=False
             ),
             task_settings=TaskSettings(auto_todo_confidence=0.85),
+            lifecycle_administrator_open_ids=frozenset({"ou_teacher"}),
         )
         self.runtime = self.runtime_manager.__enter__()
         self.now = datetime(2026, 8, 22, 11, 0, tzinfo=timezone.utc)
@@ -88,6 +100,10 @@ class TaskMaterializationTest(unittest.TestCase):
             ((run_id, 0),),
         )
         self.assertEqual(
+            self.runtime.tasks.source_candidates(tasks[1].task_id),
+            ((run_id, 1),),
+        )
+        self.assertEqual(
             len(self.runtime.reminders.list_for_task(tasks[0].task_id)),
             4,
         )
@@ -100,6 +116,39 @@ class TaskMaterializationTest(unittest.TestCase):
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0].task_id, tasks[0].task_id)
         self.assertEqual(notices[0].recipient_open_id, "ou_wang")
+
+    def test_materializes_detected_task_publisher_provenance(self) -> None:
+        run_id = self._completed_run(
+            "oc_a",
+            "om_a2",
+            ("om_a1", "om_a2"),
+            [
+                self._candidate(
+                    evidence=["om_a1"],
+                    publisher_name="老师",
+                    publisher_open_id="ou_teacher",
+                    publisher_attribution_basis="message_sender",
+                    publisher_attribution_confidence=0.97,
+                )
+            ],
+        )
+
+        result = self.runtime.tasks.materialize_run(
+            run_id, materialized_at=self.now + timedelta(minutes=1)
+        )
+
+        task_id = result.task_ids[0]
+        with Session(self.runtime.engine) as session:
+            task = session.get(Task, task_id)
+            assert task is not None
+            self.assertEqual(task.created_by_open_id, "ou_teacher")
+            self.assertEqual(task.created_by_name, "老师")
+            self.assertEqual(task.created_via, "detected")
+            self.assertEqual(
+                task.creator_attribution_basis,
+                "message_sender",
+            )
+            self.assertEqual(task.creator_attribution_confidence, 0.97)
 
     def test_materializes_one_shared_task_with_two_assignees(self) -> None:
         run_id = self._completed_run(
@@ -338,6 +387,10 @@ class TaskMaterializationTest(unittest.TestCase):
                     title=refined_title,
                     deadline="2026-08-23T18:00:00+08:00",
                     evidence=["om_a2", "om_a4"],
+                    publisher_name="老师",
+                    publisher_open_id="ou_teacher",
+                    publisher_attribution_basis="message_sender",
+                    publisher_attribution_confidence=0.94,
                 )
             ],
         )
@@ -359,6 +412,19 @@ class TaskMaterializationTest(unittest.TestCase):
             datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc),
         )
         self.assertEqual(task.confidence, 0.95)
+        with Session(self.runtime.engine) as session:
+            stored_task = session.get(Task, task_id)
+            assert stored_task is not None
+            self.assertEqual(stored_task.created_by_open_id, "ou_teacher")
+            self.assertEqual(stored_task.created_by_name, "老师")
+            self.assertEqual(
+                stored_task.creator_attribution_basis,
+                "message_sender",
+            )
+            self.assertEqual(
+                stored_task.creator_attribution_confidence,
+                0.94,
+            )
         self.assertEqual(
             self.runtime.tasks.evidence_message_ids(task_id),
             ("om_a2", "om_a4"),
@@ -419,6 +485,296 @@ class TaskMaterializationTest(unittest.TestCase):
         self.assertEqual(second.created_task_count, 1)
         self.assertEqual(second.reused_task_count, 0)
         self.assertEqual(len(self.runtime.tasks.list_tasks("oc_a")), 2)
+
+    def test_phase_9g_combines_meeting_batch_notes_review_and_card_actions(
+        self,
+    ) -> None:
+        """Keep one realistic multi-task workflow coherent across subsystems."""
+
+        self._ingest(
+            "oc_a",
+            "om_a4",
+            "ou_teacher",
+            (
+                "会议纪要：王政和李四共同补齐答辩演示方案，要求包含失败场景、"
+                "回滚步骤和现场分工表，9月3日18:00前提交。"
+            ),
+        )
+        self._ingest(
+            "oc_a",
+            "om_a5",
+            "ou_teacher",
+            "李四另外整理实验服务器账号清单，截止时间稍后再定。",
+        )
+        self._ingest(
+            "oc_a",
+            "om_a6",
+            "ou_teacher",
+            "王政在9月4日12:00前完成答辩录屏并上传共享目录。",
+        )
+        run_id = self._completed_run(
+            "oc_a",
+            "om_a6",
+            ("om_a4", "om_a5", "om_a6"),
+            [
+                self._candidate(
+                    title="补齐答辩演示方案并提交现场分工表",
+                    deadline="2026-09-03T18:00:00+08:00",
+                    evidence=["om_a4"],
+                    assignment_mode="shared",
+                    co_owners=[{"name": "李四", "open_id": "ou_li"}],
+                    publisher_name="老师",
+                    publisher_open_id="ou_teacher",
+                    publisher_attribution_basis="message_sender",
+                    publisher_attribution_confidence=0.98,
+                ),
+                self._candidate(
+                    owner_name="李四",
+                    owner_open_id="ou_li",
+                    title="整理实验服务器账号清单",
+                    deadline=None,
+                    evidence=["om_a5"],
+                    publisher_name="老师",
+                    publisher_open_id="ou_teacher",
+                ),
+                self._candidate(
+                    title="完成答辩录屏并上传共享目录",
+                    deadline="2026-09-04T12:00:00+08:00",
+                    evidence=["om_a6"],
+                    publisher_name="老师",
+                    publisher_open_id="ou_teacher",
+                ),
+            ],
+        )
+        materialized_at = self.now + timedelta(minutes=2)
+        first = self.runtime.tasks.materialize_run(
+            run_id,
+            materialized_at=materialized_at,
+        )
+        replay = self.runtime.tasks.materialize_run(
+            run_id,
+            materialized_at=materialized_at + timedelta(minutes=1),
+        )
+
+        self.assertEqual(first.created_task_count, 3)
+        self.assertTrue(replay.already_materialized)
+        self.assertEqual(replay.task_ids, first.task_ids)
+        shared_task_id, no_deadline_task_id, recording_task_id = first.task_ids
+        shared = self.runtime.tasks.get_task(shared_task_id)
+        no_deadline = self.runtime.tasks.get_task(no_deadline_task_id)
+        self.assertEqual(
+            [member.open_id for member in shared.responsible_members],
+            ["ou_wang", "ou_li"],
+        )
+        self.assertIsNone(no_deadline.deadline)
+        self.assertEqual(
+            self.runtime.reminders.list_for_task(no_deadline_task_id),
+            (),
+        )
+        self.assertEqual(
+            len(self.runtime.reminders.list_for_task(recording_task_id)),
+            4,
+        )
+
+        # Notes require current group membership even when their evidence is a
+        # private-chat message. This mirrors the production authorization gate.
+        with Session(self.runtime.engine) as session:
+            for open_id, name in (
+                ("ou_teacher", "老师"),
+                ("ou_wang", "王政"),
+                ("ou_li", "李四"),
+            ):
+                session.add(
+                    ChatMembership(
+                        chat_id="oc_a",
+                        open_id=open_id,
+                        display_name_snapshot=name,
+                        active=True,
+                        is_owner=open_id == "ou_teacher",
+                        first_synced_at=materialized_at,
+                        last_synced_at=materialized_at,
+                    )
+                )
+            session.commit()
+
+        self._ingest(
+            "oc_li_dm",
+            "om_progress",
+            "ou_li",
+            (
+                f"{format_task_code(shared_task_id)} 进度："
+                "失败场景已补齐，回滚步骤正在复核。"
+            ),
+            chat_type="p2p",
+        )
+        progress = self.runtime.task_notes.append(
+            actor_open_id="ou_li",
+            chat_id="oc_a",
+            task_id=shared_task_id,
+            note_type=TaskNoteType.PROGRESS,
+            content="失败场景已补齐，回滚步骤正在复核。",
+            source_message_id="om_progress",
+            source_chat_id="oc_li_dm",
+            idempotency_key=build_task_note_idempotency_key(
+                "phase-9g", "progress"
+            ),
+            created_at=materialized_at + timedelta(minutes=2),
+        )
+        self.assertFalse(progress.already_created)
+        self.assertEqual(progress.completion_cycle, 0)
+
+        self._ingest(
+            "oc_wang_dm",
+            "om_complete_cycle_1",
+            "ou_wang",
+            (
+                f"{format_task_code(shared_task_id)} 已完成，失败场景、"
+                "回滚步骤和现场分工表已上传共享目录。"
+            ),
+            chat_type="p2p",
+        )
+        completed_once = self.runtime.lifecycle_mutations.apply_candidate(
+            LifecycleCandidate(
+                action=LifecycleAction.COMPLETE,
+                confidence=0.99,
+                task_id=shared_task_id,
+                new_deadline=None,
+                evidence_message_ids=("om_complete_cycle_1",),
+            ),
+            actor_open_id="ou_wang",
+            trigger_message_id="om_complete_cycle_1",
+            task_code=format_task_code(shared_task_id),
+            applied_at=materialized_at + timedelta(minutes=4),
+        )
+        self.assertEqual(completed_once.new_status, TaskStatus.DONE)
+
+        reopened = self.runtime.lifecycle_mutations.apply_management_action(
+            LifecycleAction.REOPEN,
+            actor_open_id="ou_teacher",
+            request_id="phase-9g-reopen-cycle-1",
+            chat_id="oc_a",
+            task_id=shared_task_id,
+            reason="现场分工表缺少故障切换负责人，请补齐后重新提交。",
+            applied_at=materialized_at + timedelta(minutes=5),
+        )
+        self.assertEqual(reopened.new_status, TaskStatus.TODO)
+
+        # The second completion deliberately comes from a signed task-card
+        # callback and from the other co-assignee.
+        completed_twice = self.runtime.lifecycle_mutations.apply_card_action(
+            LifecycleAction.COMPLETE,
+            actor_open_id="ou_li",
+            callback_id="phase-9g-card-complete-cycle-2",
+            card_message_id="om_task_card_cycle_2",
+            card_chat_id="oc_li_dm",
+            task_code=format_task_code(shared_task_id),
+            applied_at=materialized_at + timedelta(minutes=6),
+        )
+        self.assertEqual(completed_twice.new_status, TaskStatus.DONE)
+
+        accepted = self.runtime.lifecycle_mutations.apply_management_action(
+            LifecycleAction.ACCEPT,
+            actor_open_id="ou_teacher",
+            request_id="phase-9g-accept-cycle-2",
+            chat_id="oc_a",
+            task_id=shared_task_id,
+            applied_at=materialized_at + timedelta(minutes=7),
+        )
+        self.assertEqual(accepted.new_status, TaskStatus.DONE)
+
+        # A no-deadline task can coexist in the same batch and later gain a
+        # deadline through a card action without affecting the reviewed task.
+        self.runtime.notifications.sync_all(synced_at=materialized_at)
+        rescheduled = self.runtime.lifecycle_mutations.apply_card_action(
+            LifecycleAction.RESCHEDULE,
+            actor_open_id="ou_li",
+            callback_id="phase-9g-card-reschedule-no-deadline",
+            card_message_id="om_no_deadline_card",
+            card_chat_id="oc_li_dm",
+            task_code=format_task_code(no_deadline_task_id),
+            applied_at=materialized_at + timedelta(minutes=8),
+            new_deadline=self.now + timedelta(days=14),
+        )
+        self.assertEqual(rescheduled.new_status, TaskStatus.TODO)
+        self.runtime.notifications.sync_all(
+            synced_at=materialized_at + timedelta(minutes=9)
+        )
+
+        with Session(self.runtime.engine) as session:
+            stored_shared = session.get(Task, shared_task_id)
+            assert stored_shared is not None
+            events = session.scalars(
+                select(TaskLifecycleEvent)
+                .where(TaskLifecycleEvent.task_id == shared_task_id)
+                .order_by(TaskLifecycleEvent.id)
+            ).all()
+            submissions = session.scalars(
+                select(TaskCompletionSubmission)
+                .where(TaskCompletionSubmission.task_id == shared_task_id)
+                .order_by(TaskCompletionSubmission.cycle)
+            ).all()
+            notes = session.scalars(
+                select(TaskNote)
+                .where(TaskNote.task_id == shared_task_id)
+                .order_by(TaskNote.id)
+            ).all()
+            notification_rows = session.scalars(
+                select(TaskNotification).where(
+                    TaskNotification.task_id.in_(
+                        (shared_task_id, no_deadline_task_id)
+                    )
+                )
+            ).all()
+            no_deadline_reminders = session.scalar(
+                select(func.count(TaskReminder.id)).where(
+                    TaskReminder.task_id == no_deadline_task_id,
+                    TaskReminder.status == "scheduled",
+                )
+            )
+
+        self.assertEqual(stored_shared.status, "done")
+        self.assertEqual(stored_shared.review_status, "accepted")
+        self.assertEqual(stored_shared.completion_cycle, 2)
+        self.assertEqual(
+            [event.action for event in events],
+            ["complete", "reopen", "complete", "accept"],
+        )
+        self.assertEqual(
+            [event.trigger_source for event in events],
+            ["message", "management_page", "card_action", "management_page"],
+        )
+        self.assertEqual(
+            [(item.cycle, item.review_status) for item in submissions],
+            [(1, "rework_required"), (2, "accepted")],
+        )
+        self.assertEqual(
+            [note.note_type for note in notes],
+            ["progress", "completion", "reopen"],
+        )
+        self.assertEqual(no_deadline_reminders, 4)
+        kinds = {row.kind for row in notification_rows}
+        self.assertIn(
+            TaskNotificationKind.TASK_REOPENED_COASSIGNEE.value,
+            kinds,
+        )
+        self.assertIn(
+            TaskNotificationKind.TASK_ACCEPTED_COASSIGNEE.value,
+            kinds,
+        )
+        self.assertEqual(
+            len(notification_rows),
+            len(
+                {
+                    (
+                        row.task_id,
+                        row.kind,
+                        row.recipient_open_id,
+                        row.dedupe_key,
+                    )
+                    for row in notification_rows
+                }
+            ),
+        )
 
     def test_stronger_repeated_detection_promotes_pending_to_todo(self) -> None:
         first_run = self._completed_run(
@@ -637,8 +993,12 @@ class TaskMaterializationTest(unittest.TestCase):
         evidence: list[str],
         assignment_mode: str = "single",
         co_owners: list[dict[str, str]] | None = None,
+        publisher_name: str | None = None,
+        publisher_open_id: str | None = None,
+        publisher_attribution_basis: str | None = None,
+        publisher_attribution_confidence: float | None = None,
     ) -> dict:
-        return {
+        candidate = {
             "assignment_mode": assignment_mode,
             "confidence": confidence,
             "co_owners": [] if co_owners is None else co_owners,
@@ -648,6 +1008,28 @@ class TaskMaterializationTest(unittest.TestCase):
             "deadline": deadline,
             "evidence_message_ids": evidence,
         }
+        if publisher_name is not None or publisher_open_id is not None:
+            if publisher_name is None or publisher_open_id is None:
+                raise ValueError("publisher_name and publisher_open_id are paired")
+            candidate.update(
+                {
+                    "publisher": {
+                        "name": publisher_name,
+                        "open_id": publisher_open_id,
+                    },
+                    "publisher_attribution_basis": (
+                        "message_sender"
+                        if publisher_attribution_basis is None
+                        else publisher_attribution_basis
+                    ),
+                    "publisher_attribution_confidence": (
+                        0.9
+                        if publisher_attribution_confidence is None
+                        else publisher_attribution_confidence
+                    ),
+                }
+            )
+        return candidate
 
     def _ingest(
         self,
@@ -655,12 +1037,15 @@ class TaskMaterializationTest(unittest.TestCase):
         message_id: str,
         open_id: str,
         text: str,
+        *,
+        chat_type: str = "group",
     ) -> None:
         self.message_counter += 1
         payload = deepcopy(TEXT_EVENT)
         payload["header"]["event_id"] = f"evt_{message_id}"
         payload["event"]["message"]["message_id"] = message_id
         payload["event"]["message"]["chat_id"] = chat_id
+        payload["event"]["message"]["chat_type"] = chat_type
         payload["event"]["message"]["create_time"] = str(
             int(
                 (self.now + timedelta(seconds=self.message_counter))

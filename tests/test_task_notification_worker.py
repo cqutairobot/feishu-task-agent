@@ -37,6 +37,7 @@ class TaskNotificationWorkerTest(unittest.TestCase):
             status_snapshot="done",
             deadline=None,
             deadline_before=None,
+            reason=None,
             task_created_at=self.now,
             scheduled_for=self.now,
             attempt=1,

@@ -3,6 +3,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 from pathlib import Path
+import signal
 import socket
 import subprocess
 from tempfile import TemporaryDirectory
@@ -146,6 +147,46 @@ class DevelopmentBackendStackTest(unittest.TestCase):
             exit_code = runner.run()
 
         self.assertEqual(exit_code, 0)
+        self.assertEqual(len(children), 5)
+        self.assertTrue(all(child.poll() == 0 for child in children))
+
+    def test_sigterm_stops_all_backends_instead_of_orphaning_them(self) -> None:
+        children: list[FakeProcess] = []
+        installed: dict[int, object] = {}
+
+        def create_process(*_: object, **__: object) -> FakeProcess:
+            process = FakeProcess()
+            children.append(process)
+            return process
+
+        def stop_process(process: FakeProcess) -> None:
+            process.return_code = 0
+
+        def install_handler(signum: int, handler: object) -> object:
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def request_termination(_: float) -> None:
+            handler = installed[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+        runner = DevelopmentBackendStack(
+            project_root=Path.cwd(),
+            popen_factory=create_process,
+            sleeper=request_termination,
+        )
+        with (
+            patch("app.dev_runner.signal.getsignal", return_value=signal.SIG_DFL),
+            patch("app.dev_runner.signal.signal", side_effect=install_handler),
+            patch("app.dev_runner._request_graceful_stop", stop_process),
+            redirect_stdout(io.StringIO()),
+        ):
+            exit_code = runner.run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(runner._shutdown_signal, signal.SIGTERM)
         self.assertEqual(len(children), 5)
         self.assertTrue(all(child.poll() == 0 for child in children))
 

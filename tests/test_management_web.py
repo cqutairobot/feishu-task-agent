@@ -26,8 +26,10 @@ from app.database.models import (
     ChatMembership,
     Task,
     TaskCreationEvent,
+    TaskCompletionSubmission,
     TaskLifecycleEvent,
     TaskNotification,
+    TaskNote,
     TaskReminder,
     User,
 )
@@ -38,6 +40,7 @@ from app.management.settings import ChatSettingsRepository
 from app.management.web import ManagementRequestHandler
 from app.lifecycle.mutations import LifecycleMutationService
 from app.tasks.manual_creation import ManagementTaskCreationService
+from app.tasks.notes import TaskNoteService
 
 
 class ManagementHttpServerTest(unittest.TestCase):
@@ -174,6 +177,7 @@ class ManagementHttpServerTest(unittest.TestCase):
             task_creation=ManagementTaskCreationService(
                 self.session_factory
             ),
+            task_notes=TaskNoteService(self.session_factory),
             chat_settings=ChatSettingsRepository(self.session_factory),
             directory_refresher=lambda chat_id: self.refresh_calls.append(chat_id),
         )
@@ -546,6 +550,83 @@ class ManagementHttpServerTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(json.loads(body)["error"], "sign in again")
 
+    def test_task_note_api_is_append_only_idempotent_and_readable(self) -> None:
+        credential = self.auth.consume_login_token(
+            self.auth.create_login_ticket(
+                "ou_admin", public_base_url="http://127.0.0.1:8000"
+            ).raw_token
+        )
+        headers = {
+            "Origin": self.settings.frontend_url,
+            "Content-Type": "application/json",
+            "Cookie": f"lab_task_session={credential.raw_session}",
+        }
+        payload = json.dumps(
+            {
+                "note_type": "progress",
+                "content": "管理后台记录：已完成数据清洗。",
+                "request_id": "management-task-note-1",
+            }
+        )
+        path = "/api/chats/oc_lab/tasks/1/notes"
+
+        missing_origin_status, _, _ = self._request(
+            "POST",
+            path,
+            body=payload,
+            headers={key: value for key, value in headers.items() if key != "Origin"},
+        )
+        created_status, _, created_body = self._request(
+            "POST", path, body=payload, headers=headers
+        )
+        replay_status, _, replay_body = self._request(
+            "POST", path, body=payload, headers=headers
+        )
+        conflict_status, _, _ = self._request(
+            "POST",
+            path,
+            body=json.dumps(
+                {
+                    "note_type": "progress",
+                    "content": "同一请求号不能换成另一段内容。",
+                    "request_id": "management-task-note-1",
+                }
+            ),
+            headers=headers,
+        )
+        invalid_status, _, _ = self._request(
+            "POST",
+            path,
+            body=json.dumps(
+                {
+                    "note_type": "unsupported",
+                    "content": "非法类型",
+                    "request_id": "management-task-note-invalid",
+                }
+            ),
+            headers=headers,
+        )
+
+        created = json.loads(created_body)
+        replayed = json.loads(replay_body)
+        self.assertEqual(missing_origin_status, 403)
+        self.assertEqual(created_status, 201)
+        self.assertFalse(created["note_replayed"])
+        self.assertEqual(replay_status, 200)
+        self.assertTrue(replayed["note_replayed"])
+        self.assertEqual(conflict_status, 409)
+        self.assertEqual(invalid_status, 400)
+        self.assertEqual(len(created["notes"]), 1)
+        self.assertEqual(created["notes"][0]["note_type"], "progress")
+        self.assertEqual(
+            created["notes"][0]["content"],
+            "管理后台记录：已完成数据清洗。",
+        )
+        self.assertEqual(created["notes"][0]["author_name"], "莉莉")
+        with session_scope(self.session_factory) as session:
+            notes = session.scalars(select(TaskNote)).all()
+        self.assertEqual(len(notes), 1)
+
     def test_management_reschedule_requires_origin_and_is_idempotent(self) -> None:
         credential = self.auth.consume_login_token(
             self.auth.create_login_ticket(
@@ -789,6 +870,179 @@ class ManagementHttpServerTest(unittest.TestCase):
                 .order_by(TaskLifecycleEvent.id)
             ).all()
         self.assertEqual([event.action for event in events], ["complete", "cancel", "invalidate"])
+
+    def test_management_accepts_completion_and_returns_review_snapshot(self) -> None:
+        credential = self.auth.consume_login_token(
+            self.auth.create_login_ticket(
+                "ou_admin", public_base_url="http://127.0.0.1:8000"
+            ).raw_token
+        )
+        headers = {
+            "Origin": self.settings.frontend_url,
+            "Content-Type": "application/json",
+            "Cookie": f"lab_task_session={credential.raw_session}",
+        }
+        complete_status, _, complete_body = self._request(
+            "POST",
+            "/api/chats/oc_lab/tasks/1/status",
+            body=json.dumps(
+                {
+                    "action": "complete",
+                    "request_id": "management-complete-before-accept",
+                }
+            ),
+            headers=headers,
+        )
+        accept_payload = json.dumps(
+            {
+                "action": "accept",
+                "request_id": "management-accept-http",
+            }
+        )
+        accept_status, _, accept_body = self._request(
+            "POST",
+            "/api/chats/oc_lab/tasks/1/status",
+            body=accept_payload,
+            headers=headers,
+        )
+        replay_status, _, replay_body = self._request(
+            "POST",
+            "/api/chats/oc_lab/tasks/1/status",
+            body=accept_payload,
+            headers=headers,
+        )
+
+        completed_detail = json.loads(complete_body)
+        accepted_detail = json.loads(accept_body)
+        completed_task = completed_detail["task"]
+        accepted_task = accepted_detail["task"]
+        replayed_task = json.loads(replay_body)["task"]
+        self.assertEqual(complete_status, 200)
+        self.assertEqual(completed_task["status"], "done")
+        self.assertEqual(completed_task["review_status"], "pending")
+        self.assertEqual(accept_status, 200)
+        self.assertEqual(replay_status, 200)
+        self.assertEqual(accepted_task["status"], "done")
+        self.assertEqual(accepted_task["review_status"], "accepted")
+        self.assertEqual(accepted_task["reviewed_by_open_id"], "ou_admin")
+        self.assertEqual(accepted_task["reviewed_by_name"], "莉莉")
+        self.assertEqual(accepted_task["completion_cycle"], 1)
+        self.assertEqual(
+            accepted_detail["responsibility"]["latest_reviewer_name"],
+            "莉莉",
+        )
+        self.assertEqual(len(accepted_detail["completion_submissions"]), 1)
+        self.assertEqual(
+            accepted_detail["completion_submissions"][0]["review_status"],
+            "accepted",
+        )
+        self.assertEqual(
+            [
+                item["action"]
+                for item in accepted_detail["timeline"]
+                if item["event_type"] == "lifecycle"
+            ],
+            ["complete", "accept"],
+        )
+        self.assertEqual(replayed_task["review_status"], "accepted")
+        with session_scope(self.session_factory) as session:
+            events = session.scalars(
+                select(TaskLifecycleEvent)
+                .where(TaskLifecycleEvent.task_id == 1)
+                .order_by(TaskLifecycleEvent.id)
+            ).all()
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 1,
+                    TaskCompletionSubmission.cycle == 1,
+                )
+            )
+        self.assertEqual([event.action for event in events], ["complete", "accept"])
+        self.assertEqual(events[-1].from_review_status, "pending")
+        self.assertEqual(events[-1].to_review_status, "accepted")
+        self.assertIsNotNone(submission)
+        assert submission is not None
+        self.assertEqual(submission.review_status, "accepted")
+        self.assertEqual(submission.reviewed_by_open_id, "ou_admin")
+
+    def test_management_reopens_completion_with_required_reason(self) -> None:
+        credential = self.auth.consume_login_token(
+            self.auth.create_login_ticket(
+                "ou_admin", public_base_url="http://127.0.0.1:8000"
+            ).raw_token
+        )
+        headers = {
+            "Origin": self.settings.frontend_url,
+            "Content-Type": "application/json",
+            "Cookie": f"lab_task_session={credential.raw_session}",
+        }
+        complete_status, _, _ = self._request(
+            "POST",
+            "/api/chats/oc_lab/tasks/1/status",
+            body=json.dumps(
+                {
+                    "action": "complete",
+                    "request_id": "management-complete-before-reopen",
+                }
+            ),
+            headers=headers,
+        )
+        missing_reason_status, _, _ = self._request(
+            "POST",
+            "/api/chats/oc_lab/tasks/1/status",
+            body=json.dumps(
+                {
+                    "action": "reopen",
+                    "request_id": "management-reopen-missing-reason",
+                }
+            ),
+            headers=headers,
+        )
+        reason = "当前交付缺少实验日志，请补齐日志路径后重新提交。"
+        reopen_payload = json.dumps(
+            {
+                "action": "reopen",
+                "request_id": "management-reopen-http",
+                "reason": reason,
+            }
+        )
+        reopen_status, _, reopen_body = self._request(
+            "POST",
+            "/api/chats/oc_lab/tasks/1/status",
+            body=reopen_payload,
+            headers=headers,
+        )
+        replay_status, _, replay_body = self._request(
+            "POST",
+            "/api/chats/oc_lab/tasks/1/status",
+            body=reopen_payload,
+            headers=headers,
+        )
+
+        reopened = json.loads(reopen_body)
+        replayed = json.loads(replay_body)
+        self.assertEqual(complete_status, 200)
+        self.assertEqual(missing_reason_status, 400)
+        self.assertEqual(reopen_status, 200)
+        self.assertEqual(replay_status, 200)
+        self.assertEqual(reopened["task"]["status"], "todo")
+        self.assertEqual(
+            reopened["task"]["review_status"], "rework_required"
+        )
+        self.assertEqual(reopened["task"]["completion_cycle"], 1)
+        self.assertEqual(reopened["lifecycle"][-1]["action"], "reopen")
+        self.assertEqual(reopened["lifecycle"][-1]["reason"], reason)
+        self.assertEqual(replayed["task"]["status"], "todo")
+        with session_scope(self.session_factory) as session:
+            submission = session.scalar(
+                select(TaskCompletionSubmission).where(
+                    TaskCompletionSubmission.task_id == 1,
+                    TaskCompletionSubmission.cycle == 1,
+                )
+            )
+        assert submission is not None
+        self.assertEqual(submission.review_status, "rework_required")
+        self.assertEqual(submission.review_reason, reason)
 
     def test_management_pending_review_is_strict_audited_and_notifies_owner(
         self,
@@ -1101,6 +1355,12 @@ class ManagementHttpServerTest(unittest.TestCase):
         ).encode("utf-8") + encoded_body
         client_socket, handler_socket = socket.socketpair()
         try:
+            # Task detail responses intentionally include provenance timelines.
+            # Keep the in-process socket writer from blocking before this test
+            # helper starts reading the complete response.
+            handler_socket.setsockopt(
+                socket.SOL_SOCKET, socket.SO_SNDBUF, 1_048_576
+            )
             client_socket.sendall(request)
             client_socket.shutdown(socket.SHUT_WR)
             ManagementRequestHandler(

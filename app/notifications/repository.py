@@ -25,7 +25,6 @@ from app.database.models import (
     TaskNotificationState,
     User,
 )
-from app.tasks.codes import format_task_code
 
 
 class TaskNotificationKind(StrEnum):
@@ -49,6 +48,10 @@ class TaskNotificationKind(StrEnum):
     TASK_INVALIDATED_ADMIN = "task_invalidated_admin"
     TASK_RESTORED_COASSIGNEE = "task_restored_coassignee"
     TASK_RESTORED_ADMIN = "task_restored_admin"
+    TASK_REOPENED_COASSIGNEE = "task_reopened_coassignee"
+    TASK_REOPENED_ADMIN = "task_reopened_admin"
+    TASK_ACCEPTED_COASSIGNEE = "task_accepted_coassignee"
+    TASK_ACCEPTED_ADMIN = "task_accepted_admin"
 
 
 class TaskNotificationStatus(StrEnum):
@@ -70,6 +73,8 @@ ADMINISTRATOR_NOTIFICATION_KINDS = frozenset(
         TaskNotificationKind.TASK_REASSIGNED_ADMIN.value,
         TaskNotificationKind.TASK_INVALIDATED_ADMIN.value,
         TaskNotificationKind.TASK_RESTORED_ADMIN.value,
+        TaskNotificationKind.TASK_REOPENED_ADMIN.value,
+        TaskNotificationKind.TASK_ACCEPTED_ADMIN.value,
     }
 )
 
@@ -88,6 +93,7 @@ class TaskNotificationLease:
     status_snapshot: str
     deadline: datetime | None
     deadline_before: datetime | None
+    reason: str | None
     task_created_at: datetime
     scheduled_for: datetime
     attempt: int
@@ -233,6 +239,7 @@ class TaskNotificationRepository:
                 status_snapshot=notification.status_snapshot,
                 deadline=notification.deadline_snapshot,
                 deadline_before=notification.deadline_before_snapshot,
+                reason=notification.reason_snapshot,
                 task_created_at=task.created_at,
                 scheduled_for=notification.scheduled_for,
                 attempt=notification.attempt_count,
@@ -375,24 +382,32 @@ def _sync_all_in_session(
     allowed_chat_ids: frozenset[str],
     settings: ReminderSettings,
 ) -> TaskNotificationSyncResult:
-    admitted_chat_ids = allowed_chat_ids
+    enabled_chat_ids = frozenset(
+        session.scalars(
+            select(Chat.chat_id).where(Chat.enabled.is_(True))
+        )
+    )
+    admitted_chat_ids = enabled_chat_ids
     if allowed_chat_ids:
-        admitted_chat_ids = allowed_chat_ids | frozenset(
-            session.scalars(
-                select(ChatAdministrator.chat_id)
-                .join(Chat, Chat.chat_id == ChatAdministrator.chat_id)
-                .where(
-                    Chat.chat_type == "group",
-                    Chat.enabled.is_(True),
+        admitted_chat_ids = enabled_chat_ids.intersection(
+            allowed_chat_ids
+            | frozenset(
+                session.scalars(
+                    select(ChatAdministrator.chat_id)
+                    .join(Chat, Chat.chat_id == ChatAdministrator.chat_id)
+                    .where(
+                        Chat.chat_type == "group",
+                        Chat.enabled.is_(True),
+                    )
+                    .distinct()
                 )
-                .distinct()
             )
         )
     tasks = tuple(session.scalars(select(Task).order_by(Task.id)))
     tasks_by_id = {
         task.id: task
         for task in tasks
-        if not admitted_chat_ids or task.chat_id in admitted_chat_ids
+        if task.chat_id in admitted_chat_ids
     }
     existing = tuple(
         session.scalars(select(TaskNotification).order_by(TaskNotification.id))
@@ -407,6 +422,25 @@ def _sync_all_in_session(
         for item in existing
     }
     created = 0
+    cancelled = 0
+
+    # Admission is checked again on every synchronization/claim.  Revoke all
+    # pending deliveries—not only administrator alerts—when their source chat
+    # is disabled or no longer admitted.  Sent/dead history remains immutable.
+    for notification in existing:
+        if notification.task_id in tasks_by_id or notification.status not in {
+            TaskNotificationStatus.SCHEDULED.value,
+            TaskNotificationStatus.LEASED.value,
+        }:
+            continue
+        notification.status = TaskNotificationStatus.CANCELLED.value
+        notification.worker_id = None
+        notification.leased_at = None
+        notification.lease_expires_at = None
+        notification.cancelled_at = synced_at
+        notification.cancel_reason = "task_outside_allowlist"
+        notification.updated_at = synced_at
+        cancelled += 1
 
     for task in tasks_by_id.values():
         chat_settings = session.get(ChatSettings, task.chat_id)
@@ -496,6 +530,8 @@ def _sync_all_in_session(
         "invalidate",
         "restore",
         "merge",
+        "reopen",
+        "accept",
     )
     new_events = tuple(
         session.scalars(
@@ -581,6 +617,18 @@ def _sync_all_in_session(
                 open_id: TaskNotificationKind.TASK_RESTORED_COASSIGNEE
                 for open_id, _name in responsible_members
             }
+        elif event.action == "reopen":
+            admin_kind = TaskNotificationKind.TASK_REOPENED_ADMIN
+            member_recipients = {
+                open_id: TaskNotificationKind.TASK_REOPENED_COASSIGNEE
+                for open_id, _name in responsible_members
+            }
+        elif event.action == "accept":
+            admin_kind = TaskNotificationKind.TASK_ACCEPTED_ADMIN
+            member_recipients = {
+                open_id: TaskNotificationKind.TASK_ACCEPTED_COASSIGNEE
+                for open_id, _name in responsible_members
+            }
         else:
             admin_kind = TaskNotificationKind.TASK_REASSIGNED_ADMIN
             before = dict(_event_assignees(event.assignees_before_json))
@@ -613,9 +661,10 @@ def _sync_all_in_session(
                 source_lifecycle_event_id=event.id,
                 owner_name_snapshot=(
                     responsible_names
-                    if event.action == "restore"
+                    if event.action in {"restore", "reopen"}
                     else actor_name
                 ),
+                reason_snapshot=event.reason,
             )
         for administrator in sorted(task_administrator_open_ids):
             if administrator == event.actor_open_id:
@@ -637,6 +686,7 @@ def _sync_all_in_session(
                 created_at=synced_at,
                 source_lifecycle_event_id=event.id,
                 owner_name_snapshot=responsible_names,
+                reason_snapshot=event.reason,
             )
         deferred = deferred_by_id.pop(event.id, None)
         if deferred is not None:
@@ -651,7 +701,6 @@ def _sync_all_in_session(
         state.last_lifecycle_event_id = newest_event_id
         state.updated_at = synced_at
 
-    cancelled = 0
     for notification in existing:
         if notification.kind not in {
             TaskNotificationKind.MISSING_DEADLINE_OWNER.value,
@@ -699,10 +748,10 @@ def _sync_all_in_session(
                 ):
                     desired_for = task.created_at + admin_delay
         if desired_for is not None:
-            notification.scheduled_for = desired_for
-            notification.available_at = desired_for
-            notification.updated_at = synced_at
             if reactivatable:
+                notification.scheduled_for = desired_for
+                notification.available_at = desired_for
+                notification.updated_at = synced_at
                 notification.status = TaskNotificationStatus.SCHEDULED.value
                 notification.attempt_count = 0
                 notification.worker_id = None
@@ -713,11 +762,24 @@ def _sync_all_in_session(
                 notification.last_error_code = None
                 notification.last_error_message = None
                 created += 1
-            elif notification.status == TaskNotificationStatus.LEASED.value:
-                notification.status = TaskNotificationStatus.SCHEDULED.value
-                notification.worker_id = None
-                notification.leased_at = None
-                notification.lease_expires_at = None
+            elif notification.scheduled_for != desired_for:
+                notification.scheduled_for = desired_for
+                notification.updated_at = synced_at
+                if notification.status == TaskNotificationStatus.LEASED.value:
+                    notification.status = TaskNotificationStatus.SCHEDULED.value
+                    notification.worker_id = None
+                    notification.leased_at = None
+                    notification.lease_expires_at = None
+                    notification.available_at = desired_for
+                elif notification.attempt_count == 0:
+                    notification.available_at = desired_for
+                else:
+                    # A policy change may move the original schedule, but it
+                    # must never shorten a persisted retry backoff.
+                    notification.available_at = max(
+                        notification.available_at,
+                        desired_for,
+                    )
                 continue
             continue
         if not active:
@@ -931,7 +993,14 @@ def _ensure_notification(
     owner_open_id_snapshot: str | None = None,
     owner_name_snapshot: str | None = None,
     deadline_before_snapshot: datetime | None = None,
+    reason_snapshot: str | None = None,
 ) -> int:
+    # Import lazily to avoid importing the ``app.tasks`` package while its
+    # repository module is importing this notification repository.  The task
+    # package re-exports its repository, so a module-level import here would
+    # create a circular import for direct notification-worker/test startups.
+    from app.tasks.codes import format_task_code
+
     key = (task.id, kind.value, recipient_open_id, dedupe_key)
     if key in existing_keys:
         existing = session.scalar(
@@ -980,6 +1049,7 @@ def _ensure_notification(
             status_snapshot=status_snapshot,
             deadline_snapshot=deadline_snapshot,
             deadline_before_snapshot=deadline_before_snapshot,
+            reason_snapshot=reason_snapshot,
             scheduled_for=scheduled_for,
             available_at=scheduled_for,
             status=TaskNotificationStatus.SCHEDULED.value,

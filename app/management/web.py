@@ -24,6 +24,13 @@ from app.tasks.manual_creation import (
     ManagementTaskCreationError,
     ManagementTaskCreationService,
 )
+from app.tasks.notes import (
+    TaskNoteAccessDenied,
+    TaskNoteConflict,
+    TaskNoteService,
+    TaskNoteType,
+    build_task_note_idempotency_key,
+)
 from app.management.auth import ManagementAuthError, ManagementAuthRepository
 from app.management.access import (
     AdministratorSource,
@@ -55,6 +62,7 @@ class ManagementHttpServer(ThreadingHTTPServer):
         administrators: ChatAdministratorRepository,
         lifecycle_mutations: LifecycleMutationService,
         task_creation: ManagementTaskCreationService,
+        task_notes: TaskNoteService,
         chat_settings: ChatSettingsRepository,
         directory_refresher: Any,
     ) -> None:
@@ -64,6 +72,7 @@ class ManagementHttpServer(ThreadingHTTPServer):
         self.administrators = administrators
         self.lifecycle_mutations = lifecycle_mutations
         self.task_creation = task_creation
+        self.task_notes = task_notes
         self.chat_settings = chat_settings
         self.directory_refresher = directory_refresher
         super().__init__(
@@ -372,6 +381,16 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
         if settings_match is not None:
             self._api_update_settings(settings_match.group(1))
             return
+        task_note_match = re.fullmatch(
+            r"/api/chats/([^/]+)/tasks/([1-9][0-9]*)/notes",
+            path,
+        )
+        if task_note_match is not None:
+            self._api_append_task_note(
+                task_note_match.group(1),
+                int(task_note_match.group(2)),
+            )
+            return
         task_action_match = re.fullmatch(
             r"/api/chats/([^/]+)/tasks/([1-9][0-9]*)/"
             r"(deadline|title|assignees|status)",
@@ -636,6 +655,8 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
                 if "action" not in payload or payload["action"] not in {
                     "confirm",
                     "complete",
+                    "accept",
+                    "reopen",
                     "cancel",
                     "invalidate",
                     "restore",
@@ -647,6 +668,7 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
             title = None
             owner_open_ids: tuple[str, ...] = ()
             merge_target_task_id: int | None = None
+            reason: str | None = None
             if action is LifecycleAction.RESCHEDULE:
                 if set(payload) != {"deadline", "request_id"} or not isinstance(
                     payload["deadline"], str
@@ -679,6 +701,14 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
                 ):
                     raise ValueError("invalid merge target")
                 merge_target_task_id = payload["target_task_id"]
+            elif action is LifecycleAction.REOPEN:
+                if set(payload) != {
+                    "action",
+                    "request_id",
+                    "reason",
+                } or not isinstance(payload["reason"], str):
+                    raise ValueError("invalid reopen reason")
+                reason = payload["reason"]
             elif set(payload) != {"action", "request_id"}:
                 raise ValueError("invalid fields")
             self.server.directory_refresher(chat_id)
@@ -696,6 +726,7 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
                 new_title=title,
                 new_owner_open_ids=owner_open_ids,
                 merge_target_task_id=merge_target_task_id,
+                reason=reason,
                 applied_at=datetime.now(timezone.utc),
             )
             result = self.server.reads.task_detail(
@@ -808,6 +839,76 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
             return
         self._json(
             HTTPStatus.OK if creation.already_created else HTTPStatus.CREATED,
+            result,
+            cors=True,
+        )
+
+    def _api_append_task_note(self, chat_id: str, task_id: int) -> None:
+        if not self._write_origin_allowed():
+            self._json_error(HTTPStatus.FORBIDDEN, "origin is not allowed")
+            return
+        try:
+            principal = self.server.auth.authenticate_session(
+                self._session_cookie()
+            )
+            payload = self._json_body()
+            if set(payload) != {"note_type", "content", "request_id"}:
+                raise ValueError("invalid fields")
+            if not all(
+                isinstance(payload[field], str)
+                for field in ("note_type", "content", "request_id")
+            ):
+                raise ValueError("invalid note values")
+            self.server.directory_refresher(chat_id)
+            principal = self.server.auth.authenticate_session(
+                self._session_cookie()
+            )
+            self.server.reads.dashboard(principal.actor_open_id, chat_id)
+            note = self.server.task_notes.append(
+                actor_open_id=principal.actor_open_id,
+                chat_id=chat_id,
+                task_id=task_id,
+                note_type=TaskNoteType(payload["note_type"]),
+                content=payload["content"],
+                source_message_id=None,
+                idempotency_key=build_task_note_idempotency_key(
+                    "management",
+                    payload["request_id"],
+                ),
+                created_at=datetime.now(timezone.utc),
+            )
+            result = _json_value(
+                self.server.reads.task_detail(
+                    principal.actor_open_id,
+                    chat_id,
+                    task_id,
+                )
+            )
+            assert isinstance(result, dict)
+            result["note_replayed"] = note.already_created
+        except ManagementAuthError:
+            self._json_error(HTTPStatus.UNAUTHORIZED, "sign in again")
+            return
+        except (ManagementAccessDenied, TaskNoteAccessDenied):
+            self._json_error(HTTPStatus.FORBIDDEN, "not authorized")
+            return
+        except TaskNoteConflict:
+            self._json_error(
+                HTTPStatus.CONFLICT,
+                "task note conflicts with its current task or request",
+            )
+            return
+        except (ManagementQueryError, TypeError, ValueError, KeyError):
+            self._json_error(HTTPStatus.BAD_REQUEST, "request is invalid")
+            return
+        except Exception:
+            self._json_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "unable to verify current Feishu membership",
+            )
+            return
+        self._json(
+            HTTPStatus.OK if note.already_created else HTTPStatus.CREATED,
             result,
             cors=True,
         )
@@ -953,6 +1054,7 @@ def run_management_server(
     administrators: ChatAdministratorRepository,
     lifecycle_mutations: LifecycleMutationService,
     task_creation: ManagementTaskCreationService,
+    task_notes: TaskNoteService,
     chat_settings: ChatSettingsRepository,
     directory_refresher: Any,
 ) -> None:
@@ -965,6 +1067,7 @@ def run_management_server(
         administrators,
         lifecycle_mutations,
         task_creation,
+        task_notes,
         chat_settings,
         directory_refresher,
     )

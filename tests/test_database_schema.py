@@ -24,6 +24,10 @@ from app.database.models import (
     TaskReminder,
     User,
 )
+from app.system_lifecycle import (
+    SYSTEM_REMINDER_ACTOR_NAME,
+    SYSTEM_REMINDER_ACTOR_OPEN_ID,
+)
 
 
 class DatabaseSchemaTest(unittest.TestCase):
@@ -65,6 +69,8 @@ class DatabaseSchemaTest(unittest.TestCase):
                 "task_creation_events",
                 "task_notification_state",
                 "task_notification_deferred_lifecycle_events",
+                "task_notes",
+                "task_completion_submissions",
                 "task_notifications",
                 "management_login_tokens",
                 "management_sessions",
@@ -155,6 +161,7 @@ class DatabaseSchemaTest(unittest.TestCase):
                 "ck_chat_memberships_owner_active",
             },
         )
+
         self.assertEqual(
             set(
                 inspector.get_pk_constraint(
@@ -324,13 +331,29 @@ class DatabaseSchemaTest(unittest.TestCase):
                 "ck_tasks_status",
             },
         )
+        with self.engine.connect() as connection:
+            task_triggers = {
+                row[0]
+                for row in connection.execute(
+                    text(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'trigger' AND tbl_name = 'tasks'"
+                    )
+                )
+            }
+        self.assertEqual(
+            task_triggers,
+            {"ck_tasks_provenance_insert", "ck_tasks_provenance_update"},
+        )
         task_indexes = {
             item["name"] for item in inspector.get_indexes("tasks")
         }
         self.assertEqual(
             task_indexes,
             {
+                "ix_tasks_chat_review_status",
                 "ix_tasks_chat_status",
+                "ix_tasks_creator_created",
                 "ix_tasks_deadline_status",
                 "ix_tasks_dedupe_lookup",
                 "ix_tasks_merged_into_task",
@@ -536,6 +559,7 @@ class DatabaseSchemaTest(unittest.TestCase):
             },
             {
                 "uq_task_lifecycle_events_card_action",
+                "uq_task_lifecycle_events_idempotency",
                 "uq_task_lifecycle_events_management_request",
                 "uq_task_lifecycle_events_task_trigger",
             },
@@ -550,15 +574,19 @@ class DatabaseSchemaTest(unittest.TestCase):
             {
                 "ck_task_lifecycle_events_action",
                 "ck_task_lifecycle_events_authorization",
+                "ck_task_lifecycle_events_completion_cycle",
                 "ck_task_lifecycle_events_correction_payload",
                 "ck_task_lifecycle_events_confidence",
+                "ck_task_lifecycle_events_from_review_status",
                 "ck_task_lifecycle_events_new_status",
                 "ck_task_lifecycle_events_outcome",
                 "ck_task_lifecycle_events_previous_status",
                 "ck_task_lifecycle_events_prompt_tokens",
                 "ck_task_lifecycle_events_completion_tokens",
                 "ck_task_lifecycle_events_total_tokens",
+                "ck_task_lifecycle_events_to_review_status",
                 "ck_task_lifecycle_events_trigger_source",
+                "ck_task_lifecycle_events_system_origin",
                 "ck_task_lifecycle_events_merge_target",
             },
         )
@@ -569,6 +597,7 @@ class DatabaseSchemaTest(unittest.TestCase):
             },
             {
                 "ix_task_lifecycle_events_actor_applied",
+                "ix_task_lifecycle_events_correlation",
                 "ix_task_lifecycle_events_task_applied",
                 "ix_task_lifecycle_events_trigger",
             },
@@ -600,6 +629,267 @@ class DatabaseSchemaTest(unittest.TestCase):
             },
             {"ix_task_lifecycle_evidence_message"},
         )
+        self.assertEqual(
+            {
+                item["name"]
+                for item in inspector.get_unique_constraints("task_notes")
+            },
+            {"uq_task_notes_idempotency"},
+        )
+        self.assertEqual(
+            {
+                item["name"]
+                for item in inspector.get_check_constraints("task_notes")
+            },
+            {
+                "ck_task_notes_completion_cycle",
+                "ck_task_notes_completion_tokens",
+                "ck_task_notes_confidence",
+                "ck_task_notes_content_nonempty",
+                "ck_task_notes_note_type",
+                "ck_task_notes_prompt_tokens",
+                "ck_task_notes_total_tokens",
+            },
+        )
+        note_type_constraint = next(
+            item
+            for item in inspector.get_check_constraints("task_notes")
+            if item["name"] == "ck_task_notes_note_type"
+        )
+        self.assertIn("blocker", note_type_constraint["sqltext"])
+        self.assertEqual(
+            {
+                item["name"] for item in inspector.get_indexes("task_notes")
+            },
+            {
+                "ix_task_notes_author_created",
+                "ix_task_notes_chat_created",
+                "ix_task_notes_source_chat_created",
+                "ix_task_notes_task_created",
+            },
+        )
+        self.assertEqual(
+            {
+                item["name"]
+                for item in inspector.get_unique_constraints(
+                    "task_completion_submissions"
+                )
+            },
+            {
+                "uq_task_completion_submissions_cycle",
+                "uq_task_completion_submissions_completion_note",
+                "uq_task_completion_submissions_idempotency",
+            },
+        )
+        self.assertEqual(
+            {
+                item["name"]
+                for item in inspector.get_check_constraints(
+                    "task_completion_submissions"
+                )
+            },
+            {
+                "ck_task_completion_submissions_content_nonempty",
+                "ck_task_completion_submissions_cycle",
+                "ck_task_completion_submissions_evidence",
+                "ck_task_completion_submissions_review_status",
+            },
+        )
+        self.assertEqual(
+            {
+                item["name"]
+                for item in inspector.get_indexes(
+                    "task_completion_submissions"
+                )
+            },
+            {
+                "ix_task_completion_submissions_chat_submitted",
+                "ix_task_completion_submissions_completion_note",
+                "ix_task_completion_submissions_task_cycle",
+            },
+        )
+        completion_submission_foreign_keys = {
+            item["name"]: item
+            for item in inspector.get_foreign_keys(
+                "task_completion_submissions"
+            )
+        }
+        completion_note_foreign_key = completion_submission_foreign_keys[
+            "fk_task_completion_submissions_completion_note_id_task_notes"
+        ]
+        self.assertEqual(
+            completion_note_foreign_key["constrained_columns"],
+            ["completion_note_id"],
+        )
+        self.assertEqual(
+            completion_note_foreign_key["referred_table"],
+            "task_notes",
+        )
+
+    def test_system_overdue_event_constraints_and_actor_are_persisted(self) -> None:
+        deadline = datetime(2026, 8, 30, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with session_scope(self.session_factory) as session:
+            session.add(
+                Chat(
+                    chat_id="oc_system_overdue",
+                    tenant_key="tenant_test",
+                    name="系统逾期测试群",
+                    chat_type="group",
+                )
+            )
+            session.add(
+                User(
+                    open_id="ou_system_owner",
+                    name="任务负责人",
+                    tenant_key="tenant_test",
+                    last_seen_at=deadline,
+                )
+            )
+            session.add(
+                User(
+                    open_id=SYSTEM_REMINDER_ACTOR_OPEN_ID,
+                    name=SYSTEM_REMINDER_ACTOR_NAME,
+                    tenant_key="__system__",
+                    last_seen_at=deadline,
+                )
+            )
+            session.flush()
+            task = Task(
+                chat_id="oc_system_overdue",
+                owner_open_id="ou_system_owner",
+                owner_name_snapshot="任务负责人",
+                title="逾期审计任务",
+                normalized_title="逾期审计任务",
+                description="验证系统自动逾期审计",
+                deadline=deadline,
+                status="overdue",
+                confidence=1.0,
+                created_at=deadline,
+                updated_at=deadline,
+            )
+            session.add(task)
+            session.flush()
+            event = TaskLifecycleEvent(
+                task_id=task.id,
+                actor_open_id=SYSTEM_REMINDER_ACTOR_OPEN_ID,
+                actor_name_snapshot=SYSTEM_REMINDER_ACTOR_NAME,
+                trigger_source="system",
+                action="overdue",
+                authorization_role="system",
+                task_code_snapshot="T-1A",
+                previous_status="todo",
+                new_status="overdue",
+                deadline_before=deadline,
+                deadline_after=deadline,
+                from_review_status="none",
+                to_review_status="none",
+                completion_cycle=0,
+                confidence=1.0,
+                idempotency_key="system:overdue:test-schema",
+                correlation_id="system:overdue:test-schema",
+                reason="系统自动标记为逾期",
+                applied_at=deadline,
+                created_at=deadline,
+            )
+            session.add(event)
+            session.flush()
+            self.assertEqual(
+                session.get(User, SYSTEM_REMINDER_ACTOR_OPEN_ID).name,
+                SYSTEM_REMINDER_ACTOR_NAME,
+            )
+
+        with session_scope(self.session_factory) as session:
+            task = session.get(Task, task.id)
+            session.add(
+                TaskLifecycleEvent(
+                    task_id=task.id,
+                    actor_open_id="ou_system_owner",
+                    actor_name_snapshot="任务负责人",
+                    trigger_source="message",
+                    action="overdue",
+                    authorization_role="owner",
+                    task_code_snapshot="T-1A",
+                    previous_status="todo",
+                    new_status="overdue",
+                    deadline_before=deadline,
+                    deadline_after=deadline,
+                    confidence=1.0,
+                    idempotency_key="system:overdue:invalid-human",
+                    applied_at=deadline,
+                    created_at=deadline,
+                )
+            )
+            with self.assertRaises(IntegrityError):
+                session.flush()
+            session.rollback()
+
+    def test_provenance_migration_defaults_legacy_tasks_without_guessing(self) -> None:
+        timestamp = "2026-08-27 08:00:00"
+        self.engine.dispose()
+        downgrade_database(self.database_url, "20260827_0032")
+        legacy_engine = create_database_engine(self.database_url)
+        with legacy_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO chats ("
+                    "chat_id, tenant_key, name, chat_type, enabled, "
+                    "created_at, updated_at) VALUES ("
+                    "'oc_legacy_provenance', 'tenant', '迁移群', 'group', 1, "
+                    ":timestamp, :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO users ("
+                    "open_id, tenant_key, name, last_seen_at) VALUES ("
+                    "'ou_legacy_provenance', 'tenant', '历史成员', :timestamp)"
+                ),
+                {"timestamp": timestamp},
+            )
+            legacy_task_id = connection.execute(
+                text(
+                    "INSERT INTO tasks ("
+                    "chat_id, owner_open_id, owner_name_snapshot, title, "
+                    "normalized_title, description, deadline, status, confidence, "
+                    "completed_at, created_at, updated_at) VALUES ("
+                    "'oc_legacy_provenance', 'ou_legacy_provenance', '历史成员', "
+                    "'历史任务', '历史任务', '迁移前任务', NULL, 'todo', 0.8, "
+                    "NULL, :timestamp, :timestamp) RETURNING id"
+                ),
+                {"timestamp": timestamp},
+            ).scalar_one()
+        legacy_engine.dispose()
+
+        upgrade_database(self.database_url)
+        current_engine = create_database_engine(self.database_url)
+        with current_engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT created_by_open_id, created_by_name, created_via, "
+                    "creator_attribution_basis, creator_attribution_confidence, "
+                    "review_status, reviewed_by_open_id, reviewed_by_name, "
+                    "reviewed_at, completion_cycle, last_completed_by_open_id, "
+                    "last_completed_by_name, last_completed_at FROM tasks "
+                    "WHERE id = :task_id"
+                ),
+                {"task_id": legacy_task_id},
+            ).one()
+        current_engine.dispose()
+
+        self.assertIsNone(row.created_by_open_id)
+        self.assertIsNone(row.created_by_name)
+        self.assertEqual(row.created_via, "unknown")
+        self.assertEqual(row.creator_attribution_basis, "unknown")
+        self.assertIsNone(row.creator_attribution_confidence)
+        self.assertEqual(row.review_status, "none")
+        self.assertIsNone(row.reviewed_by_open_id)
+        self.assertIsNone(row.reviewed_by_name)
+        self.assertIsNone(row.reviewed_at)
+        self.assertEqual(row.completion_cycle, 0)
+        self.assertIsNone(row.last_completed_by_open_id)
+        self.assertIsNone(row.last_completed_by_name)
+        self.assertIsNone(row.last_completed_at)
 
     def test_lifecycle_migration_downgrade_preserves_tasks(self) -> None:
         self.engine.dispose()

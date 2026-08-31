@@ -72,6 +72,8 @@ class TaskSnapshot:
     created_at: datetime
     updated_at: datetime
     assignees: tuple["TaskAssigneeSnapshot", ...] = ()
+    review_status: str = "none"
+    completion_cycle: int = 0
 
     @property
     def public_code(self) -> str:
@@ -538,6 +540,49 @@ class TaskRepository:
                 chat_name=chat_name,
             )
 
+    def find_review_target_across_chats(
+        self,
+        task_id: int,
+        *,
+        chat_ids: frozenset[str] | None = None,
+    ) -> CrossChatTaskEntry | None:
+        """Resolve one completed task that can be accepted or reopened.
+
+        Authorization is deliberately handled by the caller before any model
+        request.  This query only establishes the exact task-code, group and
+        review-state boundary used by the read-only review detector.
+        """
+
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, int)
+            or task_id < 1
+        ):
+            raise ValueError("task_id must be a positive integer")
+        normalized_chat_ids = _optional_chat_ids(chat_ids)
+        with session_scope(self._session_factory) as session:
+            conditions = [
+                Task.id == task_id,
+                Chat.chat_type == "group",
+                Task.status == TaskStatus.DONE.value,
+                Task.review_status.in_(("pending", "accepted")),
+                Task.completion_cycle >= 1,
+            ]
+            if normalized_chat_ids is not None:
+                conditions.append(Task.chat_id.in_(normalized_chat_ids))
+            row = session.execute(
+                select(Task, Chat.name)
+                .join(Chat, Chat.chat_id == Task.chat_id)
+                .where(*conditions)
+            ).one_or_none()
+            if row is None:
+                return None
+            task, chat_name = row
+            return CrossChatTaskEntry(
+                task=_snapshot(task),
+                chat_name=chat_name,
+            )
+
     def evidence_message_ids(self, task_id: int) -> tuple[str, ...]:
         with session_scope(self._session_factory) as session:
             return tuple(
@@ -697,6 +742,20 @@ class TaskRepository:
     def _refine_existing_task(task: Task, candidate: TaskCandidate) -> None:
         """Apply only safe, monotonic details learned by a later run."""
 
+        if (
+            task.created_via == "detected"
+            and task.created_by_open_id is None
+            and candidate.publisher is not None
+        ):
+            task.created_by_open_id = candidate.publisher.open_id
+            task.created_by_name = candidate.publisher.name
+            task.creator_attribution_basis = (
+                candidate.publisher_attribution_basis
+            )
+            task.creator_attribution_confidence = (
+                candidate.publisher_attribution_confidence
+            )
+
         if task.deadline is not None or candidate.deadline is None:
             return
         if task.status not in {
@@ -727,6 +786,19 @@ class TaskRepository:
             chat_id=chat_id,
             owner_open_id=candidate.owner.open_id,
             owner_name_snapshot=candidate.owner.name,
+            created_by_open_id=(
+                None
+                if candidate.publisher is None
+                else candidate.publisher.open_id
+            ),
+            created_by_name=(
+                None if candidate.publisher is None else candidate.publisher.name
+            ),
+            created_via="detected",
+            creator_attribution_basis=candidate.publisher_attribution_basis,
+            creator_attribution_confidence=(
+                candidate.publisher_attribution_confidence
+            ),
             title=candidate.title,
             normalized_title=_normalize_title(candidate.title),
             description=candidate.description,
@@ -843,7 +915,14 @@ def _materialization_input(
 
 
 def _candidate_owner_names(payload: str) -> dict[str, str]:
-    """Extract historical owner pairs before the strict grounding pass."""
+    """Extract historical owner and publisher pairs before grounding.
+
+    Stored detection results are replayed against a reconstructed context.
+    Publisher attribution was added after the original result contract, so
+    this helper accepts both old candidates (owner only) and new candidates
+    that also carry a publisher.  The resulting participant set is still
+    limited to identities explicitly present in the stored model output.
+    """
 
     try:
         value: Any = json.loads(payload)
@@ -857,7 +936,7 @@ def _candidate_owner_names(payload: str) -> dict[str, str]:
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-        raw_owners = [candidate.get("owner")]
+        raw_owners = [candidate.get("owner"), candidate.get("publisher")]
         co_owners = candidate.get("co_owners", [])
         if isinstance(co_owners, list):
             raw_owners.extend(co_owners)
@@ -1004,6 +1083,8 @@ def _snapshot(task: Task) -> TaskSnapshot:
         created_at=task.created_at,
         updated_at=task.updated_at,
         assignees=_task_assignee_snapshots(task),
+        review_status=task.review_status,
+        completion_cycle=task.completion_cycle,
     )
 
 

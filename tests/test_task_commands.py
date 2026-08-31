@@ -119,6 +119,23 @@ class TaskCommandProcessorTest(unittest.TestCase):
         self.assertIsNone(wrong_chat)
         self.assertIsNone(terminal)
 
+    def test_exact_review_target_requires_completed_reviewable_task(self) -> None:
+        target = self.repository.find_review_target_across_chats(
+            5,
+            chat_ids=frozenset({"oc_a"}),
+        )
+        wrong_chat = self.repository.find_review_target_across_chats(
+            5,
+            chat_ids=frozenset({"oc_b"}),
+        )
+        open_task = self.repository.find_review_target_across_chats(2)
+
+        self.assertEqual(target.task.title, "已经完成")
+        self.assertEqual(target.task.review_status, "pending")
+        self.assertEqual(target.task.completion_cycle, 1)
+        self.assertIsNone(wrong_chat)
+        self.assertIsNone(open_task)
+
     def test_deadline_is_rendered_in_shanghai_time(self) -> None:
         result = self._processor().handle(self._message("oc_a"))
 
@@ -521,6 +538,8 @@ class TaskCommandProcessorTest(unittest.TestCase):
                         "已经完成",
                         TaskStatus.DONE,
                         completed_at=self.now,
+                        review_status="pending",
+                        completion_cycle=1,
                     ),
                     self._task(
                         "oc_a",
@@ -547,6 +566,8 @@ class TaskCommandProcessorTest(unittest.TestCase):
         cancelled_at: datetime | None = None,
         owner_open_id: str = "ou_wang",
         owner_name: str = "王政",
+        review_status: str = "none",
+        completion_cycle: int = 0,
     ) -> Task:
         return Task(
             chat_id=chat_id,
@@ -560,6 +581,8 @@ class TaskCommandProcessorTest(unittest.TestCase):
             confidence=0.95,
             completed_at=completed_at,
             cancelled_at=cancelled_at,
+            review_status=review_status,
+            completion_cycle=completion_cycle,
             created_at=self.now,
             updated_at=self.now,
         )

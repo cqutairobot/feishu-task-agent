@@ -106,6 +106,11 @@ test("browser API requests rely on the HttpOnly session cookie", async () => {
   assert.match(source, /不是任务，撤销/);
   assert.match(source, /恢复为开放任务/);
   assert.match(source, /"restore"/);
+  assert.match(source, /验收通过/);
+  assert.match(source, /待管理员验收/);
+  assert.match(source, /已验收通过/);
+  assert.match(source, /"accept"/);
+  assert.match(source, /completionReviewable/);
   assert.match(source, /合并重复任务/);
   assert.match(source, /onSave\("merge"/);
   assert.match(source, /sourceMergeable/);
@@ -113,6 +118,11 @@ test("browser API requests rely on the HttpOnly session cookie", async () => {
   assert.match(source, /"confirm" \| "complete"/);
   assert.match(source, /＋ 新建任务/);
   assert.match(source, /创建并通知负责人/);
+  assert.match(source, /正在核验群成员/);
+  assert.match(source, /重新加载群成员/);
+  assert.match(source, /已填写的任务内容会保留/);
+  assert.match(source, /setTaskCreationMembersError/);
+  assert.doesNotMatch(source, /setCreating\(false\);\s*handleFailure\(reason,\s*"当前群成员加载失败/);
   assert.match(source, /管理员手动补建/);
   assert.match(source, /creation_source/);
   assert.match(source, /搜索任务/);
@@ -189,6 +199,16 @@ test("browser API requests rely on the HttpOnly session cookie", async () => {
   assert.match(source, /setSelected\(task\.assignees\.map/);
   assert.match(source, /hourCycle: "h23"/);
   assert.match(source, /item\("hour"\) === "24" \? "00"/);
+  assert.match(source, /责任链/);
+  assert.match(source, /完成周期/);
+  assert.match(source, /任务全过程/);
+  assert.match(source, /completion_submissions/);
+  assert.match(source, /detail\.timeline/);
+  assert.match(source, /截止时间已调整，旧提醒自动取消/);
+  assert.match(source, /readableReason\(event\.reason\)/);
+  assert.match(source, /role="dialog"/);
+  assert.match(source, /event\.key === "Escape"/);
+  assert.match(source, /previousFocus\?\.focus\(\)/);
   assert.doesNotMatch(source, /actor_open_id=|请输入.*Open ID/i);
 });
 
@@ -207,4 +227,56 @@ test("base group settings cannot overwrite administrator notification recipients
   assert.doesNotMatch(baseSettingsSource, /administratorNotificationOpenIds/);
   assert.doesNotMatch(baseSettingsSource, /administrator_notification_mode/);
   assert.doesNotMatch(baseSettingsSource, /administrator_notification_open_ids/);
+});
+
+test("provenance timeline filters and long content disclosures remain accessible", async () => {
+  const source = await readFile(
+    new URL("../app/dashboard-client.tsx", import.meta.url),
+    "utf8",
+  );
+  const styles = await readFile(
+    new URL("../app/globals.css", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /type TimelineFilter = "all" \| "status" \| "note" \| "completion_submission" \| "delivery"/);
+  assert.match(source, /aria-label="按事件类型筛选"/);
+  assert.match(source, /aria-pressed=\{filter === option\.value\}/);
+  assert.match(source, /aria-live="polite"/);
+  assert.match(source, /timelineEventMatchesFilter\(event, filter\)/);
+  assert.match(source, /function ExpandableText/);
+  assert.match(source, /aria-controls=\{contentId\}/);
+  assert.match(source, /aria-expanded=\{expanded\}/);
+  assert.match(source, /content\.scrollHeight > content\.clientHeight \+ 1/);
+  assert.match(source, /new ResizeObserver\(update\)/);
+  assert.match(source, /展开全文/);
+  assert.match(source, /收起全文/);
+  assert.match(styles, /\.timeline-filter-bar \{[^}]*flex-wrap:wrap/);
+  assert.match(styles, /\.expandable-copy\.is-collapsed>p \{[^}]*-webkit-line-clamp:4/);
+  assert.match(styles, /@media \(max-width:600px\)[\s\S]*\.timeline-filter-bar button \{ min-height:44px/);
+});
+
+test("task detail requests are invalidated when the active group changes", async () => {
+  const source = await readFile(
+    new URL("../app/dashboard-client.tsx", import.meta.url),
+    "utf8",
+  );
+  const openStart = source.indexOf("async function openTask");
+  const openEnd = source.indexOf("\n  async function loadTaskCreationMembers", openStart);
+  const switchStart = source.indexOf("function changeChat");
+  const switchEnd = source.indexOf("\n  async function logout", switchStart);
+  assert.notEqual(openStart, -1);
+  assert.notEqual(openEnd, -1);
+  assert.notEqual(switchStart, -1);
+  assert.notEqual(switchEnd, -1);
+
+  const openTaskSource = source.slice(openStart, openEnd);
+  const changeChatSource = source.slice(switchStart, switchEnd);
+  assert.match(openTaskSource, /taskDetailAbort\.current\?\.abort\(\)/);
+  assert.match(openTaskSource, /token !== taskDetailRequest\.current \|\| activeChatId\.current !== requestedChatId/);
+  assert.match(openTaskSource, /setDetail\(taskDetail\)/);
+  assert.match(changeChatSource, /activeChatId\.current = nextChatId/);
+  assert.match(changeChatSource, /taskDetailRequest\.current \+= 1/);
+  assert.match(changeChatSource, /taskDetailAbort\.current\?\.abort\(\)/);
+  assert.match(changeChatSource, /setDetail\(null\)/);
 });

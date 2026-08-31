@@ -97,6 +97,21 @@ class LifecycleContractTest(unittest.TestCase):
         with self.assertRaisesRegex(LifecycleOutputError, "not supported"):
             self._parse(payload)
 
+    def test_high_risk_review_actions_are_rejected_by_legacy_contract(self) -> None:
+        schema = lifecycle_detection_json_schema()
+        actions = schema["properties"]["updates"]["items"]["properties"][
+            "action"
+        ]["enum"]
+        for action in ("accept", "reopen"):
+            with self.subTest(action=action):
+                self.assertNotIn(action, actions)
+                payload = self._completion()
+                payload["updates"][0]["action"] = action
+                with self.assertRaisesRegex(
+                    LifecycleOutputError, "not supported"
+                ):
+                    self._parse(payload)
+
     def test_rejects_task_from_another_chat(self) -> None:
         payload = self._completion()
         payload["updates"][0]["task_id"] = 99

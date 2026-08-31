@@ -40,7 +40,9 @@ TASK_BATCH_DETECTION_INSTRUCTIONS = """你是群聊任务识别器。只依据�
 12. messages 中的 mentions 是飞书原始 @ 的精确目标映射；正文里的 `key`（例如 `@_user_1`）必须使用对应的 open_id，并将 mentions.name 作为本群已确认的任务姓名原样输出，不能改用飞书显示名或靠上下文猜测。有效群成员被 @ 后，如果同时给出可执行动作和时间，应视为已形成任务。
 13. 组织、主持、召开或参加一个明确时间的会议/讨论也属于可执行任务；例如“@李明 今天 21:00 前开智能体讨论会议”应创建任务，deadline 为该时间。
 14. focus 消息出现“我来做”“我来补”“好的”等省略表达时，只能回指它之前最近且语义连续的事项；不得越过更新的主题去续接更早的旧任务。
-15. 只输出符合契约的 JSON 对象，不要 Markdown、解释文字或额外字段。
+15. publisher 表示这项任务由谁在群里发布或明确布置：通常是证据消息中发出指令、分派任务的人，而不是负责人本人。publisher 必须从 known_participants 中选择，必须是 evidence_message_ids 中至少一条消息的 sender_open_id；如果无法可靠判断发布者，publisher 必须为 null，publisher_attribution_basis 必须为 unknown，publisher_attribution_confidence 必须为 null。
+16. publisher_attribution_basis 只能是 message_sender（发布者就是证据消息发送者）或 explicit_assignment（会议纪要等证据正文明确写出由另一位成员布置/分派，发布者姓名或 @ 必须出现在证据中）；只有 publisher 不为 null 时才填写对应依据和 0 到 1 的置信度。
+17. 只输出符合契约的 JSON 对象，不要 Markdown、解释文字或额外字段。
 """
 
 
@@ -100,6 +102,13 @@ def build_task_batch_detection_input(
                     "description": "string",
                     "deadline": "ISO 8601 string with timezone, or null",
                     "evidence_message_ids": ["message_id"],
+                    "publisher": "object with name/open_id, or null",
+                    "publisher_attribution_basis": (
+                        "message_sender, explicit_assignment, or unknown"
+                    ),
+                    "publisher_attribution_confidence": (
+                        "number between 0 and 1, or null"
+                    ),
                 }
             ]
         },

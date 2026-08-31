@@ -54,6 +54,14 @@ class Chat(Base):
         back_populates="chat"
     )
     tasks: Mapped[list["Task"]] = relationship(back_populates="chat")
+    task_notes: Mapped[list["TaskNote"]] = relationship(
+        back_populates="chat",
+        cascade="all, delete-orphan",
+        foreign_keys="TaskNote.chat_id",
+    )
+    completion_submissions: Mapped[list["TaskCompletionSubmission"]] = relationship(
+        back_populates="chat", cascade="all, delete-orphan"
+    )
     settings: Mapped["ChatSettings | None"] = relationship(
         back_populates="chat", uselist=False, cascade="all, delete-orphan"
     )
@@ -346,7 +354,7 @@ class User(Base):
         back_populates="user"
     )
     assigned_tasks: Mapped[list["Task"]] = relationship(
-        back_populates="owner"
+        back_populates="owner", foreign_keys="Task.owner_open_id"
     )
     task_assignments: Mapped[list["TaskAssignee"]] = relationship(
         back_populates="user"
@@ -715,6 +723,29 @@ class Task(Base):
             "OR (status != 'cancelled' AND cancelled_at IS NULL)",
             name="ck_tasks_cancelled_state",
         ),
+        CheckConstraint(
+            "created_via IN ('detected', 'management', 'system', 'unknown')",
+            name="ck_tasks_created_via",
+        ),
+        CheckConstraint(
+            "creator_attribution_basis IN "
+            "('message_sender', 'explicit_assignment', 'unknown')",
+            name="ck_tasks_creator_attribution_basis",
+        ),
+        CheckConstraint(
+            "creator_attribution_confidence IS NULL OR "
+            "(creator_attribution_confidence >= 0 "
+            "AND creator_attribution_confidence <= 1)",
+            name="ck_tasks_creator_attribution_confidence",
+        ),
+        CheckConstraint(
+            "review_status IN ('none', 'pending', 'accepted', 'rework_required')",
+            name="ck_tasks_review_status",
+        ),
+        CheckConstraint(
+            "completion_cycle >= 0",
+            name="ck_tasks_completion_cycle",
+        ),
         Index("ix_tasks_chat_status", "chat_id", "status"),
         Index("ix_tasks_owner_status", "owner_open_id", "status"),
         Index("ix_tasks_deadline_status", "deadline", "status"),
@@ -724,6 +755,10 @@ class Task(Base):
             "owner_open_id",
             "normalized_title",
             "deadline",
+        ),
+        Index("ix_tasks_creator_created", "created_by_open_id", "created_at"),
+        Index(
+            "ix_tasks_chat_review_status", "chat_id", "review_status", "updated_at"
         ),
     )
 
@@ -735,6 +770,17 @@ class Task(Base):
         ForeignKey("users.open_id", ondelete="RESTRICT"), nullable=False
     )
     owner_name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_by_open_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.open_id", ondelete="RESTRICT")
+    )
+    created_by_name: Mapped[str | None] = mapped_column(String(255))
+    created_via: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
+    creator_attribution_basis: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unknown", server_default="unknown"
+    )
+    creator_attribution_confidence: Mapped[float | None] = mapped_column(Float)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     normalized_title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -743,6 +789,22 @@ class Task(Base):
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     cancelled_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    review_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="none", server_default="none"
+    )
+    reviewed_by_open_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.open_id", ondelete="RESTRICT")
+    )
+    reviewed_by_name: Mapped[str | None] = mapped_column(String(255))
+    reviewed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    completion_cycle: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_completed_by_open_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.open_id", ondelete="RESTRICT")
+    )
+    last_completed_by_name: Mapped[str | None] = mapped_column(String(255))
+    last_completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     merged_into_task_id: Mapped[int | None] = mapped_column(
         ForeignKey("tasks.id", ondelete="RESTRICT")
     )
@@ -755,7 +817,9 @@ class Task(Base):
     )
 
     chat: Mapped[Chat] = relationship(back_populates="tasks")
-    owner: Mapped[User] = relationship(back_populates="assigned_tasks")
+    owner: Mapped[User] = relationship(
+        back_populates="assigned_tasks", foreign_keys=[owner_open_id]
+    )
     assignees: Mapped[list["TaskAssignee"]] = relationship(
         back_populates="task",
         cascade="all, delete-orphan",
@@ -777,6 +841,16 @@ class Task(Base):
         back_populates="task",
         cascade="all, delete-orphan",
         uselist=False,
+    )
+    notes: Mapped[list["TaskNote"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskNote.created_at",
+    )
+    completion_submissions: Mapped[list["TaskCompletionSubmission"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskCompletionSubmission.cycle",
     )
 
 
@@ -872,6 +946,10 @@ class TaskLifecycleEvent(Base):
             "trigger_management_request_id",
             name="uq_task_lifecycle_events_management_request",
         ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_task_lifecycle_events_idempotency",
+        ),
         CheckConstraint(
             "(trigger_source = 'message' "
             "AND trigger_message_db_id IS NOT NULL "
@@ -890,17 +968,31 @@ class TaskLifecycleEvent(Base):
             "AND trigger_card_action_id IS NULL "
             "AND trigger_card_message_id IS NULL "
             "AND trigger_card_chat_id IS NULL "
-            "AND trigger_management_request_id IS NOT NULL)",
+            "AND trigger_management_request_id IS NOT NULL) OR "
+            "(trigger_source = 'system' "
+            "AND trigger_message_db_id IS NULL "
+            "AND trigger_card_action_id IS NULL "
+            "AND trigger_card_message_id IS NULL "
+            "AND trigger_card_chat_id IS NULL "
+            "AND trigger_management_request_id IS NULL)",
             name="ck_task_lifecycle_events_trigger_source",
         ),
         CheckConstraint(
-            "action IN ('confirm', 'complete', 'reschedule', 'cancel', 'rename', "
-            "'reassign', 'invalidate', 'restore', 'merge')",
+            "action IN ('confirm', 'complete', 'accept', 'reopen', 'reschedule', "
+            "'cancel', 'rename', 'reassign', 'invalidate', 'restore', 'merge', "
+            "'overdue')",
             name="ck_task_lifecycle_events_action",
         ),
         CheckConstraint(
-            "authorization_role IN ('owner', 'administrator')",
+            "authorization_role IN ('owner', 'administrator', 'system')",
             name="ck_task_lifecycle_events_authorization",
+        ),
+        CheckConstraint(
+            "(trigger_source = 'system' AND action = 'overdue' "
+            "AND authorization_role = 'system') OR "
+            "(trigger_source != 'system' AND action != 'overdue' "
+            "AND authorization_role != 'system')",
+            name="ck_task_lifecycle_events_system_origin",
         ),
         CheckConstraint(
             "previous_status IN ('pending', 'todo', 'overdue', 'done', 'cancelled')",
@@ -927,9 +1019,30 @@ class TaskLifecycleEvent(Base):
             name="ck_task_lifecycle_events_total_tokens",
         ),
         CheckConstraint(
+            "from_review_status IS NULL OR from_review_status IN "
+            "('none', 'pending', 'accepted', 'rework_required')",
+            name="ck_task_lifecycle_events_from_review_status",
+        ),
+        CheckConstraint(
+            "to_review_status IS NULL OR to_review_status IN "
+            "('none', 'pending', 'accepted', 'rework_required')",
+            name="ck_task_lifecycle_events_to_review_status",
+        ),
+        CheckConstraint(
+            "completion_cycle IS NULL OR completion_cycle >= 0",
+            name="ck_task_lifecycle_events_completion_cycle",
+        ),
+        CheckConstraint(
             "(action = 'confirm' AND previous_status = 'pending' "
             "AND new_status = 'todo') OR "
             "(action = 'complete' AND new_status = 'done') OR "
+            "(action = 'accept' AND previous_status = 'done' "
+            "AND new_status = 'done') OR "
+            "(action = 'reopen' AND previous_status = 'done' "
+            "AND new_status IN ('todo', 'overdue')) OR "
+            "(action = 'overdue' AND previous_status = 'todo' "
+            "AND new_status = 'overdue' AND deadline_before IS NOT NULL "
+            "AND deadline_after = deadline_before) OR "
             "(action = 'cancel' AND new_status = 'cancelled') OR "
             "(action = 'invalidate' AND new_status = 'cancelled') OR "
             "(action = 'restore' AND previous_status IN ('done', 'cancelled') "
@@ -972,6 +1085,9 @@ class TaskLifecycleEvent(Base):
         Index(
             "ix_task_lifecycle_events_trigger", "trigger_message_db_id"
         ),
+        Index(
+            "ix_task_lifecycle_events_correlation", "correlation_id"
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -981,6 +1097,7 @@ class TaskLifecycleEvent(Base):
     actor_open_id: Mapped[str] = mapped_column(
         ForeignKey("users.open_id", ondelete="RESTRICT"), nullable=False
     )
+    actor_name_snapshot: Mapped[str | None] = mapped_column(String(255))
     trigger_source: Mapped[str] = mapped_column(
         String(16), nullable=False, default="message", server_default="message"
     )
@@ -993,6 +1110,9 @@ class TaskLifecycleEvent(Base):
     trigger_management_request_id: Mapped[str | None] = mapped_column(
         String(128)
     )
+    source_message_id: Mapped[str | None] = mapped_column(String(128))
+    correlation_id: Mapped[str | None] = mapped_column(String(128))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
     action: Mapped[str] = mapped_column(String(16), nullable=False)
     authorization_role: Mapped[str] = mapped_column(String(16), nullable=False)
     task_code_snapshot: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1004,6 +1124,10 @@ class TaskLifecycleEvent(Base):
     title_after: Mapped[str | None] = mapped_column(String(200))
     assignees_before_json: Mapped[str | None] = mapped_column(Text)
     assignees_after_json: Mapped[str | None] = mapped_column(Text)
+    from_review_status: Mapped[str | None] = mapped_column(String(20))
+    to_review_status: Mapped[str | None] = mapped_column(String(20))
+    reason: Mapped[str | None] = mapped_column(Text)
+    completion_cycle: Mapped[int | None] = mapped_column(Integer)
     merge_target_task_id: Mapped[int | None] = mapped_column(
         ForeignKey("tasks.id", ondelete="RESTRICT")
     )
@@ -1058,6 +1182,185 @@ class TaskLifecycleEvidence(Base):
         back_populates="evidence_links"
     )
     message: Mapped[Message] = relationship()
+
+
+class TaskNote(Base):
+    """Append-only progress or correction note attached to one task."""
+
+    __tablename__ = "task_notes"
+    __table_args__ = (
+        CheckConstraint(
+            "note_type IN ('progress', 'blocker', 'completion', 'delay', "
+            "'reopen', 'general', 'correction')",
+            name="ck_task_notes_note_type",
+        ),
+        CheckConstraint(
+            "length(trim(content)) > 0",
+            name="ck_task_notes_content_nonempty",
+        ),
+        CheckConstraint(
+            "completion_cycle >= 0",
+            name="ck_task_notes_completion_cycle",
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="ck_task_notes_confidence",
+        ),
+        CheckConstraint(
+            "prompt_tokens IS NULL OR prompt_tokens >= 0",
+            name="ck_task_notes_prompt_tokens",
+        ),
+        CheckConstraint(
+            "completion_tokens IS NULL OR completion_tokens >= 0",
+            name="ck_task_notes_completion_tokens",
+        ),
+        CheckConstraint(
+            "total_tokens IS NULL OR total_tokens >= 0",
+            name="ck_task_notes_total_tokens",
+        ),
+        UniqueConstraint(
+            "idempotency_key", name="uq_task_notes_idempotency"
+        ),
+        Index("ix_task_notes_task_created", "task_id", "created_at"),
+        Index("ix_task_notes_chat_created", "chat_id", "created_at"),
+        Index("ix_task_notes_source_chat_created", "source_chat_id", "created_at"),
+        Index("ix_task_notes_author_created", "author_open_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    chat_id: Mapped[str] = mapped_column(
+        ForeignKey("chats.chat_id", ondelete="CASCADE"), nullable=False
+    )
+    author_open_id: Mapped[str] = mapped_column(
+        ForeignKey("users.open_id", ondelete="RESTRICT"), nullable=False
+    )
+    author_name_snapshot: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    note_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    source_message_id: Mapped[str | None] = mapped_column(String(128))
+    source_chat_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chats.chat_id", ondelete="RESTRICT")
+    )
+    completion_cycle: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    provider: Mapped[str | None] = mapped_column(String(32))
+    model: Mapped[str | None] = mapped_column(String(128))
+    response_format: Mapped[str | None] = mapped_column(String(32))
+    model_request_id: Mapped[str | None] = mapped_column(String(128))
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), nullable=False, default=utc_now
+    )
+
+    task: Mapped[Task] = relationship(back_populates="notes")
+    chat: Mapped[Chat] = relationship(
+        back_populates="task_notes",
+        foreign_keys=[chat_id],
+    )
+    author: Mapped[User] = relationship()
+    completion_submission: Mapped["TaskCompletionSubmission | None"] = relationship(
+        back_populates="completion_note",
+        uselist=False,
+    )
+
+
+class TaskCompletionSubmission(Base):
+    """Immutable evidence snapshot for one completion cycle."""
+
+    __tablename__ = "task_completion_submissions"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id", "cycle", name="uq_task_completion_submissions_cycle"
+        ),
+        UniqueConstraint(
+            "idempotency_key", name="uq_task_completion_submissions_idempotency"
+        ),
+        UniqueConstraint(
+            "completion_note_id",
+            name="uq_task_completion_submissions_completion_note",
+        ),
+        CheckConstraint("cycle >= 1", name="ck_task_completion_submissions_cycle"),
+        CheckConstraint(
+            "length(trim(content_snapshot)) > 0",
+            name="ck_task_completion_submissions_content_nonempty",
+        ),
+        CheckConstraint(
+            "review_status IN ('pending', 'accepted', 'rework_required')",
+            name="ck_task_completion_submissions_review_status",
+        ),
+        CheckConstraint(
+            "evidence_json IS NOT NULL", name="ck_task_completion_submissions_evidence"
+        ),
+        Index(
+            "ix_task_completion_submissions_task_cycle", "task_id", "cycle"
+        ),
+        Index(
+            "ix_task_completion_submissions_chat_submitted",
+            "chat_id",
+            "submitted_at",
+        ),
+        Index(
+            "ix_task_completion_submissions_completion_note",
+            "completion_note_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    chat_id: Mapped[str] = mapped_column(
+        ForeignKey("chats.chat_id", ondelete="CASCADE"), nullable=False
+    )
+    cycle: Mapped[int] = mapped_column(Integer, nullable=False)
+    submitted_by_open_id: Mapped[str] = mapped_column(
+        ForeignKey("users.open_id", ondelete="RESTRICT"), nullable=False
+    )
+    submitted_by_name_snapshot: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    source_message_id: Mapped[str | None] = mapped_column(String(128))
+    completion_note_id: Mapped[int | None] = mapped_column(
+        ForeignKey("task_notes.id", ondelete="RESTRICT")
+    )
+    content_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
+    submitted_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), nullable=False, default=utc_now
+    )
+    review_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending"
+    )
+    reviewed_by_open_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.open_id", ondelete="RESTRICT")
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    review_reason: Mapped[str | None] = mapped_column(Text)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+
+    task: Mapped[Task] = relationship(back_populates="completion_submissions")
+    chat: Mapped[Chat] = relationship(back_populates="completion_submissions")
+    submitter: Mapped[User] = relationship(
+        foreign_keys=[submitted_by_open_id]
+    )
+    reviewer: Mapped[User | None] = relationship(
+        foreign_keys=[reviewed_by_open_id]
+    )
+    completion_note: Mapped[TaskNote | None] = relationship(
+        back_populates="completion_submission"
+    )
 
 
 class TaskReminder(Base):
@@ -1208,7 +1511,9 @@ class TaskNotification(Base):
             "'task_assignees_changed', 'task_invalidated_assignee', "
             "'task_renamed_admin', 'task_reassigned_admin', "
             "'task_invalidated_admin', 'task_restored_coassignee', "
-            "'task_restored_admin')",
+            "'task_restored_admin', 'task_reopened_coassignee', "
+            "'task_reopened_admin', 'task_accepted_coassignee', "
+            "'task_accepted_admin')",
             name="ck_task_notifications_kind",
         ),
         CheckConstraint(
@@ -1288,6 +1593,7 @@ class TaskNotification(Base):
     deadline_before_snapshot: Mapped[datetime | None] = mapped_column(
         UTCDateTime()
     )
+    reason_snapshot: Mapped[str | None] = mapped_column(Text)
     scheduled_for: Mapped[datetime] = mapped_column(
         UTCDateTime(), nullable=False
     )

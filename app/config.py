@@ -388,6 +388,7 @@ class LifecycleSettings:
     """Safety gate for private natural-language lifecycle writes."""
 
     private_writes_enabled: bool = False
+    review_writes_enabled: bool = False
     context_limit: int = 20
     minimum_confidence: float = 0.9
 
@@ -399,6 +400,18 @@ class LifecycleSettings:
         if raw_enabled not in {"true", "false"}:
             raise SettingsError(
                 "LIFECYCLE_PRIVATE_WRITES_ENABLED must be true or false"
+            )
+        raw_review_enabled = values.get(
+            "LIFECYCLE_REVIEW_WRITES_ENABLED", "false"
+        ).strip().lower()
+        if raw_review_enabled not in {"true", "false"}:
+            raise SettingsError(
+                "LIFECYCLE_REVIEW_WRITES_ENABLED must be true or false"
+            )
+        if raw_review_enabled == "true" and raw_enabled != "true":
+            raise SettingsError(
+                "LIFECYCLE_REVIEW_WRITES_ENABLED requires "
+                "LIFECYCLE_PRIVATE_WRITES_ENABLED=true"
             )
         try:
             context_limit = int(
@@ -426,6 +439,7 @@ class LifecycleSettings:
             )
         return cls(
             private_writes_enabled=raw_enabled == "true",
+            review_writes_enabled=raw_review_enabled == "true",
             context_limit=context_limit,
             minimum_confidence=minimum_confidence,
         )

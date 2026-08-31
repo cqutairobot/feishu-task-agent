@@ -196,6 +196,15 @@ class DirectoryService:
         """Force an authoritative refresh and surface every failure."""
 
         snapshot = self._provider.fetch(chat_id)
+        # A Feishu external group can report the tenant that owns the chat,
+        # while message events identify the tenant in which this app is
+        # installed. Those values are not interchangeable. Management-page
+        # refreshes have no message event, so leave the tenant unspecified and
+        # let an existing chat retain its already-validated database tenant.
+        # A new chat still requires chat_type and can use the directory tenant.
+        persisted_tenant_key = tenant_key
+        if persisted_tenant_key is None and chat_type is not None:
+            persisted_tenant_key = snapshot.chat_tenant_key
         self._repository.apply_directory_snapshot(
             snapshot.chat_id,
             snapshot.chat_name,
@@ -210,7 +219,7 @@ class DirectoryService:
             },
             authoritative_members=True,
             chat_type=chat_type,
-            tenant_key=tenant_key or snapshot.chat_tenant_key,
+            tenant_key=persisted_tenant_key,
             updated_at=datetime.now(timezone.utc),
         )
         now = self._monotonic()

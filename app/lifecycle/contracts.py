@@ -37,6 +37,8 @@ class LifecycleOutputError(ValueError):
 class LifecycleAction(StrEnum):
     CONFIRM = "confirm"
     COMPLETE = "complete"
+    ACCEPT = "accept"
+    REOPEN = "reopen"
     RESCHEDULE = "reschedule"
     CANCEL = "cancel"
     RENAME = "rename"
@@ -52,6 +54,8 @@ MODEL_LIFECYCLE_ACTIONS = tuple(
     if action
     not in {
         LifecycleAction.CONFIRM,
+        LifecycleAction.ACCEPT,
+        LifecycleAction.REOPEN,
         LifecycleAction.RESTORE,
         LifecycleAction.MERGE,
     }
@@ -302,11 +306,11 @@ def _action(value: Any) -> LifecycleAction:
         action = LifecycleAction(value)
     except ValueError as exc:
         raise LifecycleOutputError("action is not supported") from exc
-    if action in {
-        LifecycleAction.CONFIRM,
-        LifecycleAction.RESTORE,
-        LifecycleAction.MERGE,
-    }:
+    # The JSON schema is only the first line of defence. JSON-object fallback
+    # providers can return any string, so enforce the exact model allowlist
+    # locally as well.  Review actions use their own read-only contract and
+    # must never fall through to the mutation-oriented lifecycle pipeline.
+    if action not in MODEL_LIFECYCLE_ACTIONS:
         raise LifecycleOutputError("action is not supported")
     return action
 

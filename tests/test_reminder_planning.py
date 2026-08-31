@@ -20,11 +20,17 @@ from app.database.models import (
     ChatSettings,
     Task,
     TaskAssignee,
+    TaskLifecycleEvent,
     TaskReminder,
     User,
 )
 from app.reminders.repository import ReminderRepository, ReminderStatus
 from app.reminders.schedule import ReminderKind, reminder_moments
+from app.system_lifecycle import (
+    SYSTEM_REMINDER_ACTOR_NAME,
+    SYSTEM_REMINDER_ACTOR_OPEN_ID,
+    overdue_transition_key,
+)
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -424,7 +430,47 @@ class ReminderPlanningTest(unittest.TestCase):
         reminder = self.repository.list_for_task(task_id)[0]
         self.assertEqual(reminder.kind, ReminderKind.OVERDUE)
         with session_scope(self.session_factory) as session:
-            self.assertEqual(session.get(Task, task_id).status, "overdue")
+            task = session.get(Task, task_id)
+            self.assertEqual(task.status, "overdue")
+            events = tuple(
+                session.scalars(
+                    select(TaskLifecycleEvent).where(
+                        TaskLifecycleEvent.task_id == task_id
+                    )
+                )
+            )
+            self.assertEqual(len(events), 1)
+            event = events[0]
+            self.assertEqual(event.actor_open_id, SYSTEM_REMINDER_ACTOR_OPEN_ID)
+            self.assertEqual(event.actor_name_snapshot, SYSTEM_REMINDER_ACTOR_NAME)
+            self.assertEqual(event.trigger_source, "system")
+            self.assertEqual(event.action, "overdue")
+            self.assertEqual(event.authorization_role, "system")
+            self.assertEqual(event.previous_status, "todo")
+            self.assertEqual(event.new_status, "overdue")
+            self.assertEqual(event.deadline_before, task.deadline)
+            self.assertEqual(event.deadline_after, task.deadline)
+            self.assertEqual(event.source_message_id, None)
+            self.assertEqual(event.completion_cycle, task.completion_cycle)
+            self.assertEqual(event.from_review_status, task.review_status)
+            self.assertEqual(event.to_review_status, task.review_status)
+            self.assertEqual(event.confidence, 1.0)
+            self.assertEqual(
+                event.idempotency_key,
+                overdue_transition_key(task_id, task.deadline),
+            )
+
+        second = self.repository.sync_task(task_id, synced_at=self.now)
+        self.assertEqual(second.task_statuses_changed, 0)
+        with session_scope(self.session_factory) as session:
+            self.assertEqual(
+                session.scalar(
+                    select(TaskLifecycleEvent.id).where(
+                        TaskLifecycleEvent.task_id == task_id
+                    )
+                ),
+                events[0].id,
+            )
 
     def test_sync_all_reports_active_rows_across_tasks(self) -> None:
         self._add_task(deadline=self.now + timedelta(days=7))
