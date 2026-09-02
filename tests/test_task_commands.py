@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock
+from types import SimpleNamespace
 
 from app.database.engine import (
     create_database_engine,
@@ -22,6 +23,7 @@ from app.tasks.commands import (
     is_task_command_message,
 )
 from app.tasks.repository import TaskRepository, TaskStatus
+from app.tasks.query_contracts import TaskQueryIntent, TaskQueryScope
 from tests.test_messages import TEXT_EVENT
 
 
@@ -413,6 +415,332 @@ class TaskCommandProcessorTest(unittest.TestCase):
 
         self.assertIsNone(self._processor().handle(message))
 
+    def test_natural_private_query_lists_only_senders_open_tasks(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.SELF,
+                target_name=None,
+                status="open",
+                confidence=0.98,
+            )
+        )
+        message = self._message(
+            "oc_direct",
+            text="还有哪些任务没完成？",
+            mentions=[],
+            chat_type="p2p",
+        )
+        processor = self._processor(query_detector=detector)
+
+        self.assertTrue(processor.matches(message))
+        result = processor.handle(message)
+
+        self.assertIsNotNone(result)
+        self.assertIn("你的未完成任务（共 4 项）", result.reply_text)
+        self.assertIn("另一个群的秘密任务", result.reply_text)
+        self.assertNotIn("李四的任务", result.reply_text)
+        detector.detect_task_query.assert_called_once()
+
+    def test_natural_private_query_keeps_admin_sender_scope(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.SELF,
+                target_name=None,
+                status="open",
+                confidence=0.99,
+            )
+        )
+        message = self._message(
+            "oc_direct",
+            text="帮我看看我的待办",
+            mentions=[],
+            chat_type="p2p",
+            sender_open_id="ou_wang",
+        )
+        result = self._processor(
+            admins={"ou_wang"}, query_detector=detector
+        ).handle(message)
+
+        self.assertIn("你的未完成任务（共 4 项）", result.reply_text)
+        self.assertNotIn("管理员视图", result.reply_text)
+        self.assertNotIn("李四的任务", result.reply_text)
+
+    def test_admin_unqualified_natural_query_lists_all_managed_tasks(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.SELF,
+                target_name=None,
+                status="open",
+                confidence=0.99,
+            )
+        )
+        chat_administrators = Mock()
+        chat_administrators.chat_ids_for_administrator.return_value = frozenset(
+            {"oc_a"}
+        )
+        message = self._message(
+            "oc_direct",
+            text="现在还有什么事没做？",
+            mentions=[],
+            chat_type="p2p",
+            sender_open_id="ou_admin",
+        )
+
+        result = self._processor(
+            chat_administrators=chat_administrators,
+            query_detector=detector,
+        ).handle(message)
+
+        self.assertIn("全部未完成任务（管理员视图，共 4 项）", result.reply_text)
+        self.assertIn("李四的任务", result.reply_text)
+        self.assertNotIn("另一个群的秘密任务", result.reply_text)
+
+    def test_admin_natural_person_query_resolves_name_and_limits_chat_scope(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.PERSON,
+                target_name="李四",
+                status="open",
+                confidence=0.98,
+            )
+        )
+        aliases = Mock()
+        aliases.resolve_open_ids_across_chats.return_value = frozenset(
+            {"ou_li"}
+        )
+        chat_administrators = Mock()
+        chat_administrators.chat_ids_for_administrator.return_value = frozenset(
+            {"oc_a"}
+        )
+        message = self._message(
+            "oc_direct",
+            text="李四还有哪些任务没完成？",
+            mentions=[],
+            chat_type="p2p",
+            sender_open_id="ou_admin",
+        )
+
+        result = self._processor(
+            chat_administrators=chat_administrators,
+            alias_repository=aliases,
+            query_detector=detector,
+            private_cards=True,
+        ).handle(message)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.succeeded)
+        self.assertIn("李四的未完成任务（共 1 项）", result.reply_text)
+        self.assertIn("李四的任务", result.reply_text)
+        self.assertIn("负责人：李四", result.reply_text)
+        self.assertNotIn("另一个群的秘密任务", result.reply_text)
+        rendered = json.dumps(result.reply_card, ensure_ascii=False)
+        self.assertIn("李四的未完成任务", rendered)
+        aliases.resolve_open_ids_across_chats.assert_called_with(
+            "李四", chat_ids=frozenset({"oc_a"})
+        )
+
+    def test_admin_person_query_rejects_unknown_name_without_listing_tasks(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.PERSON,
+                target_name="不存在的人",
+                status="open",
+                confidence=0.98,
+            )
+        )
+        aliases = Mock()
+        aliases.resolve_open_ids_across_chats.return_value = frozenset()
+        chat_administrators = Mock()
+        chat_administrators.chat_ids_for_administrator.return_value = frozenset(
+            {"oc_a"}
+        )
+
+        result = self._processor(
+            chat_administrators=chat_administrators,
+            alias_repository=aliases,
+            query_detector=detector,
+        ).handle(
+            self._message(
+                "oc_direct",
+                text="不存在的人还有哪些任务没完成？",
+                mentions=[],
+                chat_type="p2p",
+                sender_open_id="ou_admin",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.succeeded)
+        self.assertIn("未找到当前管理范围内", result.reply_text)
+
+    def test_admin_person_query_rejects_ambiguous_name(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.PERSON,
+                target_name="王政",
+                status="open",
+                confidence=0.98,
+            )
+        )
+        aliases = Mock()
+        aliases.resolve_open_ids_across_chats.return_value = frozenset(
+            {"ou_wang", "ou_other_wang"}
+        )
+        chat_administrators = Mock()
+        chat_administrators.chat_ids_for_administrator.return_value = frozenset(
+            {"oc_a", "oc_b"}
+        )
+
+        result = self._processor(
+            chat_administrators=chat_administrators,
+            alias_repository=aliases,
+            query_detector=detector,
+        ).handle(
+            self._message(
+                "oc_direct",
+                text="王政还有哪些任务没完成？",
+                mentions=[],
+                chat_type="p2p",
+                sender_open_id="ou_admin",
+            )
+        )
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.succeeded)
+        self.assertIn("对应多个不同成员", result.reply_text)
+
+    def test_person_scope_is_not_exposed_to_non_administrators(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.PERSON,
+                target_name="李四",
+                status="open",
+                confidence=0.99,
+            )
+        )
+        aliases = Mock()
+
+        message = self._message(
+            "oc_direct",
+            text="李四还有哪些任务没完成？",
+            mentions=[],
+            chat_type="p2p",
+        )
+        processor = self._processor(
+            alias_repository=aliases,
+            query_detector=detector,
+        )
+
+        self.assertFalse(processor.matches(message))
+        self.assertIsNone(processor.handle(message))
+        aliases.resolve_open_ids_across_chats.assert_not_called()
+
+    def test_admin_all_scope_lists_all_managed_tasks(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.ALL,
+                target_name=None,
+                status="open",
+                confidence=0.99,
+            )
+        )
+        message = self._message(
+            "oc_direct",
+            text="所有人的未完成任务有哪些？",
+            mentions=[],
+            chat_type="p2p",
+            sender_open_id="ou_admin",
+        )
+        processor = self._processor(
+            admins={"ou_admin"},
+            allowed_chats={"oc_a"},
+            query_detector=detector,
+        )
+
+        self.assertTrue(processor.matches(message))
+        result = processor.handle(message)
+
+        self.assertIn("全部未完成任务（管理员视图，共 4 项）", result.reply_text)
+        self.assertIn("李四的任务", result.reply_text)
+        self.assertNotIn("另一个群的秘密任务", result.reply_text)
+
+    def test_all_scope_is_not_exposed_to_non_administrators(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.ALL,
+                target_name=None,
+                status="open",
+                confidence=0.99,
+            )
+        )
+        message = self._message(
+            "oc_direct",
+            text="所有人的未完成任务有哪些？",
+            mentions=[],
+            chat_type="p2p",
+            sender_open_id="ou_wang",
+        )
+        processor = self._processor(query_detector=detector)
+
+        self.assertFalse(processor.matches(message))
+        self.assertIsNone(processor.handle(message))
+
+    def test_natural_private_query_does_not_execute_other_scopes(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.return_value = SimpleNamespace(
+            result=TaskQueryIntent(
+                is_query=True,
+                scope=TaskQueryScope.PERSON,
+                target_name="王政",
+                status="open",
+                confidence=0.99,
+            )
+        )
+        message = self._message(
+            "oc_direct",
+            text="王政还有哪些任务没完成？",
+            mentions=[],
+            chat_type="p2p",
+        )
+        processor = self._processor(query_detector=detector)
+
+        self.assertFalse(processor.matches(message))
+        self.assertIsNone(processor.handle(message))
+
+    def test_natural_query_classifier_failure_does_not_match(self) -> None:
+        detector = Mock()
+        detector.detect_task_query.side_effect = RuntimeError("provider down")
+        message = self._message(
+            "oc_direct",
+            text="我还有什么待办？",
+            mentions=[],
+            chat_type="p2p",
+        )
+
+        processor = self._processor(query_detector=detector)
+
+        self.assertFalse(processor.matches(message))
+        self.assertIsNone(processor.handle(message))
+        self.assertEqual(detector.detect_task_query.call_count, 1)
+
     def test_limit_validation_rejects_bool_and_out_of_range(self) -> None:
         for limit in (True, 0, 101):
             with self.subTest(limit=limit):
@@ -429,6 +757,8 @@ class TaskCommandProcessorTest(unittest.TestCase):
         card_actions: bool = False,
         chat_name_refresher=None,
         chat_administrators=None,
+        alias_repository=None,
+        query_detector=None,
     ) -> TaskCommandProcessor:
         return TaskCommandProcessor(
             self.repository,
@@ -440,6 +770,8 @@ class TaskCommandProcessorTest(unittest.TestCase):
             card_actions_enabled=card_actions,
             chat_name_refresher=chat_name_refresher,
             chat_administrators=chat_administrators,
+            alias_repository=alias_repository,
+            query_detector=query_detector,
         )
 
     def _message(

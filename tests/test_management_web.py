@@ -38,6 +38,7 @@ from app.management.auth import ManagementAuthRepository
 from app.management.queries import ManagementReadApi
 from app.management.settings import ChatSettingsRepository
 from app.management.web import ManagementRequestHandler
+from app.identity.aliases import AliasRepository
 from app.lifecycle.mutations import LifecycleMutationService
 from app.tasks.manual_creation import ManagementTaskCreationService
 from app.tasks.notes import TaskNoteService
@@ -156,6 +157,7 @@ class ManagementHttpServerTest(unittest.TestCase):
                 )
             )
         self.auth = ManagementAuthRepository(self.session_factory)
+        self.aliases = AliasRepository(self.session_factory)
         self.administrators = ChatAdministratorRepository(self.session_factory)
         self.refresh_calls: list[str] = []
         self.settings = ManagementWebSettings(
@@ -180,6 +182,7 @@ class ManagementHttpServerTest(unittest.TestCase):
             task_notes=TaskNoteService(self.session_factory),
             chat_settings=ChatSettingsRepository(self.session_factory),
             directory_refresher=lambda chat_id: self.refresh_calls.append(chat_id),
+            aliases=self.aliases,
         )
 
     def tearDown(self) -> None:
@@ -514,6 +517,40 @@ class ManagementHttpServerTest(unittest.TestCase):
         self.assertEqual(
             self.refresh_calls,
             ["oc_lab", "oc_lab", "oc_lab", "oc_lab"],
+        )
+
+    def test_administrator_can_set_member_alias_without_self_binding(self) -> None:
+        with session_scope(self.session_factory) as session:
+            session.delete(
+                session.scalar(
+                    select(ChatMemberAlias).where(
+                        ChatMemberAlias.chat_id == "oc_lab",
+                        ChatMemberAlias.open_id == "ou_member",
+                    )
+                )
+            )
+
+        credential = self.auth.consume_login_token(
+            self.auth.create_login_ticket(
+                "ou_admin", public_base_url="http://127.0.0.1:8000"
+            ).raw_token
+        )
+        status, _, body = self._request(
+            "POST",
+            "/api/chats/oc_lab/members/ou_member/alias",
+            body=json.dumps({"alias": "王政"}),
+            headers={
+                "Origin": self.settings.frontend_url,
+                "Content-Type": "application/json",
+                "Cookie": f"lab_task_session={credential.raw_session}",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["alias"], "王政")
+        self.assertEqual(
+            self.aliases.for_member("oc_lab", "ou_member").source,
+            "administrator_page",
         )
 
     def test_member_read_fails_closed_when_live_refresh_revokes_actor(self) -> None:

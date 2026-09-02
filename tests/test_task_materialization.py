@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.config import DatabaseSettings, TaskSettings
 from app.database.models import (
     ChatMembership,
+    User,
     Task,
     TaskCompletionSubmission,
     TaskLifecycleEvent,
@@ -907,6 +908,60 @@ class TaskMaterializationTest(unittest.TestCase):
             )
 
         self.assertEqual(self.runtime.tasks.list_tasks("oc_a"), ())
+
+    def test_allows_active_member_with_administrator_alias_without_message(self) -> None:
+        with Session(self.runtime.engine) as session:
+            session.add(
+                User(
+                    open_id="ou_directory_only",
+                    union_id=None,
+                    name="目录成员",
+                    tenant_key="tenant_a",
+                    last_seen_at=self.now,
+                    created_at=self.now,
+                    updated_at=self.now,
+                )
+            )
+            session.add(
+                ChatMembership(
+                    chat_id="oc_a",
+                    open_id="ou_directory_only",
+                    display_name_snapshot="目录成员",
+                    active=True,
+                    is_owner=False,
+                    first_synced_at=self.now,
+                    last_synced_at=self.now,
+                    left_at=None,
+                )
+            )
+            session.commit()
+        self.runtime.aliases.bind_for_administrator(
+            "oc_a", "ou_directory_only", "目录成员"
+        )
+
+        run_id = self._completed_run(
+            "oc_a",
+            "om_a2",
+            ("om_a1", "om_a2"),
+            [
+                self._candidate(
+                    owner_name="目录成员",
+                    owner_open_id="ou_directory_only",
+                    evidence=["om_a1"],
+                )
+            ],
+        )
+
+        result = self.runtime.tasks.materialize_run(
+            run_id, materialized_at=self.now + timedelta(minutes=1)
+        )
+
+        self.assertEqual(result.created_task_count, 1)
+        task = self.runtime.tasks.get_task(result.task_ids[0])
+        self.assertIsNotNone(task)
+        assert task is not None
+        self.assertEqual(task.owner_open_id, "ou_directory_only")
+        self.assertEqual(task.owner_name, "目录成员")
 
     def test_rejects_failed_run(self) -> None:
         run_id, lease = self._started_run(

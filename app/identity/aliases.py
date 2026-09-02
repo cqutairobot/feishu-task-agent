@@ -10,7 +10,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.database.engine import session_scope
-from app.database.models import Chat, ChatMemberAlias, Message, User
+from app.database.models import (
+    Chat,
+    ChatMemberAlias,
+    ChatMembership,
+    Message,
+    User,
+)
 
 
 class AliasError(ValueError):
@@ -69,6 +75,7 @@ class AliasRepository:
         *,
         source: str = "manual",
         confidence: float = 1.0,
+        require_observed: bool = True,
     ) -> AliasBinding:
         chat_id = chat_id.strip()
         open_id = open_id.strip()
@@ -85,7 +92,10 @@ class AliasRepository:
 
         now = datetime.now(timezone.utc)
         with session_scope(self._session_factory) as session:
-            self._require_observed_member(session, chat_id, open_id)
+            if require_observed:
+                self._require_observed_member(session, chat_id, open_id)
+            else:
+                self._require_active_member(session, chat_id, open_id)
             claimed_name = session.scalar(
                 select(ChatMemberAlias).where(
                     ChatMemberAlias.chat_id == chat_id,
@@ -128,6 +138,22 @@ class AliasRepository:
             session.flush()
             return self._to_binding(existing)
 
+    def bind_for_administrator(
+        self,
+        chat_id: str,
+        open_id: str,
+        alias: str,
+    ) -> AliasBinding:
+        """Bind a current group member even if they have not sent a message."""
+
+        return self.bind(
+            chat_id,
+            open_id,
+            alias,
+            source="administrator_page",
+            require_observed=False,
+        )
+
     def resolve(self, chat_id: str, alias: str) -> AliasBinding | None:
         normalized = normalize_alias(alias)
         with session_scope(self._session_factory) as session:
@@ -138,6 +164,49 @@ class AliasRepository:
                 )
             )
             return None if record is None else self._to_binding(record)
+
+    def resolve_open_ids_across_chats(
+        self,
+        alias: str,
+        *,
+        chat_ids: frozenset[str] | None = None,
+    ) -> frozenset[str]:
+        """Resolve a confirmed name to active members in an admin scope.
+
+        The result deliberately contains only Open IDs from enabled groups and
+        active memberships. A caller must still apply its own administrator
+        authorization and handle ambiguity when a name maps to multiple users.
+        """
+
+        normalized = normalize_alias(alias)
+        normalized_chat_ids = None
+        if chat_ids is not None:
+            normalized_chat_ids = frozenset(
+                item.strip() for item in chat_ids if item.strip()
+            )
+            if not normalized_chat_ids:
+                return frozenset()
+        with session_scope(self._session_factory) as session:
+            conditions = [
+                ChatMemberAlias.normalized_alias == normalized,
+                ChatMembership.active.is_(True),
+                Chat.chat_type == "group",
+                Chat.enabled.is_(True),
+            ]
+            if normalized_chat_ids is not None:
+                conditions.append(ChatMemberAlias.chat_id.in_(normalized_chat_ids))
+            return frozenset(
+                session.scalars(
+                    select(ChatMemberAlias.open_id)
+                    .join(
+                        ChatMembership,
+                        (ChatMembership.chat_id == ChatMemberAlias.chat_id)
+                        & (ChatMembership.open_id == ChatMemberAlias.open_id),
+                    )
+                    .join(Chat, Chat.chat_id == ChatMemberAlias.chat_id)
+                    .where(*conditions)
+                )
+            )
 
     def for_member(self, chat_id: str, open_id: str) -> AliasBinding | None:
         """Return the member's single confirmed name in one chat."""
@@ -218,6 +287,26 @@ class AliasRepository:
         if observed is None:
             raise AliasError(
                 f"user {open_id} has not sent a stored message in chat {chat_id}"
+            )
+
+    @staticmethod
+    def _require_active_member(
+        session: Session, chat_id: str, open_id: str
+    ) -> None:
+        if session.get(Chat, chat_id) is None:
+            raise AliasError(f"unknown chat_id: {chat_id}")
+        if session.get(User, open_id) is None:
+            raise AliasError(f"unknown open_id: {open_id}")
+        active = session.scalar(
+            select(ChatMembership.id).where(
+                ChatMembership.chat_id == chat_id,
+                ChatMembership.open_id == open_id,
+                ChatMembership.active.is_(True),
+            )
+        )
+        if active is None:
+            raise AliasError(
+                f"user {open_id} is not an active member of chat {chat_id}"
             )
 
     @staticmethod

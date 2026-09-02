@@ -568,6 +568,15 @@ def main(argv: list[str] | None = None) -> int:
             if lifecycle_settings.private_writes_enabled
             else None
         )
+        # Natural-language task queries are optional when lifecycle writes are
+        # disabled. Reuse the lifecycle detector when it already exists;
+        # otherwise use the configured task model if available.
+        query_llm_settings = lifecycle_llm_settings
+        if query_llm_settings is None:
+            try:
+                query_llm_settings = load_task_llm_settings()
+            except SettingsError:
+                query_llm_settings = None
     except SettingsError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
@@ -593,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime.repository,
         )
         lifecycle_detector = None
+        query_detector = None
         lifecycle_commands = None
         note_commands = None
         review_commands = None
@@ -629,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
             lifecycle_detector = OpenAICompatibleTaskDetector(
                 lifecycle_llm_settings
             )
+            query_detector = lifecycle_detector
             private_context_builder = PrivateLifecycleDetectionContextBuilder(
                 TaskDetectionContextBuilder(
                     runtime.repository,
@@ -672,6 +683,10 @@ def main(argv: list[str] | None = None) -> int:
                 mutations=runtime.lifecycle_mutations,
                 review_writes_enabled=lifecycle_settings.review_writes_enabled,
             )
+        elif query_llm_settings is not None:
+            from app.agent.provider import OpenAICompatibleTaskDetector
+
+            query_detector = OpenAICompatibleTaskDetector(query_llm_settings)
         management_auth = getattr(runtime, "management_auth", None)
         if management_web_settings.enabled and management_auth is not None:
             from app.management.commands import ManagementCommandProcessor
@@ -693,12 +708,15 @@ def main(argv: list[str] | None = None) -> int:
                 management_commands,
                 note_commands,
                 review_commands,
+                query_detector=query_detector,
             )
         except KeyboardInterrupt:
             print("\nFeishu listener stopped.")
         finally:
             if lifecycle_detector is not None:
                 lifecycle_detector.close()
+            elif query_detector is not None:
+                query_detector.close()
     return 0
 
 
@@ -873,6 +891,7 @@ def _run_management_server() -> int:
                     runtime.task_notes,
                     runtime.chat_settings,
                     directory.refresh_strict,
+                    runtime.aliases,
                 )
             except KeyboardInterrupt:
                 print("\nManagement read server stopped cleanly.")

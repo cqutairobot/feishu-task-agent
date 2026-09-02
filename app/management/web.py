@@ -42,6 +42,7 @@ from app.management.queries import (
     ManagementQueryError,
     ManagementReadApi,
 )
+from app.identity.aliases import AliasConflictError, AliasError, AliasRepository
 from app.management.settings import ChatSettingsError, ChatSettingsRepository
 
 
@@ -65,6 +66,7 @@ class ManagementHttpServer(ThreadingHTTPServer):
         task_notes: TaskNoteService,
         chat_settings: ChatSettingsRepository,
         directory_refresher: Any,
+        aliases: AliasRepository | None = None,
     ) -> None:
         self.settings = settings
         self.auth = auth
@@ -75,6 +77,7 @@ class ManagementHttpServer(ThreadingHTTPServer):
         self.task_notes = task_notes
         self.chat_settings = chat_settings
         self.directory_refresher = directory_refresher
+        self.aliases = aliases
         super().__init__(
             (settings.bind_host, settings.port), ManagementRequestHandler
         )
@@ -381,6 +384,14 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
         if settings_match is not None:
             self._api_update_settings(settings_match.group(1))
             return
+        alias_match = re.fullmatch(
+            r"/api/chats/([^/]+)/members/([^/]+)/alias", path
+        )
+        if alias_match is not None:
+            self._api_update_member_alias(
+                alias_match.group(1), alias_match.group(2)
+            )
+            return
         task_note_match = re.fullmatch(
             r"/api/chats/([^/]+)/tasks/([1-9][0-9]*)/notes",
             path,
@@ -622,6 +633,58 @@ class ManagementRequestHandler(BaseHTTPRequestHandler):
                 else HTTPStatus.BAD_REQUEST
             )
             self._json_error(status, "settings cannot be updated")
+            return
+        except (TypeError, ValueError, KeyError):
+            self._json_error(HTTPStatus.BAD_REQUEST, "request is invalid")
+            return
+        except Exception:
+            self._json_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "unable to verify current Feishu membership",
+            )
+            return
+        self._json(HTTPStatus.OK, _json_value(result), cors=True)
+
+    def _api_update_member_alias(self, chat_id: str, open_id: str) -> None:
+        if not self._write_origin_allowed():
+            self._json_error(HTTPStatus.FORBIDDEN, "origin is not allowed")
+            return
+        if self.server.aliases is None:
+            self._json_error(HTTPStatus.SERVICE_UNAVAILABLE, "alias management is unavailable")
+            return
+        try:
+            principal = self.server.auth.authenticate_session(
+                self._session_cookie()
+            )
+            payload = self._json_body()
+            if set(payload) != {"alias"} or not isinstance(payload["alias"], str):
+                raise ValueError("invalid fields")
+            # Refresh first so a departed member cannot retain a stale alias.
+            self.server.directory_refresher(chat_id)
+            principal = self.server.auth.authenticate_session(
+                self._session_cookie()
+            )
+            self.server.chat_settings.get_for_administrator(
+                principal.actor_open_id, chat_id
+            )
+            result = self.server.aliases.bind_for_administrator(
+                chat_id,
+                open_id,
+                payload["alias"],
+            )
+        except ManagementAuthError:
+            self._json_error(HTTPStatus.UNAUTHORIZED, "sign in again")
+            return
+        except AliasConflictError as exc:
+            self._json_error(HTTPStatus.CONFLICT, str(exc))
+            return
+        except (ChatSettingsError, AliasError) as exc:
+            status = (
+                HTTPStatus.FORBIDDEN
+                if str(exc) == "actor must be an administrator of this group"
+                else HTTPStatus.BAD_REQUEST
+            )
+            self._json_error(status, str(exc))
             return
         except (TypeError, ValueError, KeyError):
             self._json_error(HTTPStatus.BAD_REQUEST, "request is invalid")
@@ -1057,6 +1120,7 @@ def run_management_server(
     task_notes: TaskNoteService,
     chat_settings: ChatSettingsRepository,
     directory_refresher: Any,
+    aliases: AliasRepository | None = None,
 ) -> None:
     if not settings.enabled:
         raise ValueError("MANAGEMENT_WEB_ENABLED is false")
@@ -1070,6 +1134,7 @@ def run_management_server(
         task_notes,
         chat_settings,
         directory_refresher,
+        aliases,
     )
     print(
         f"Management server started at {settings.public_base_url}; "

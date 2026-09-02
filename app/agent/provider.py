@@ -47,6 +47,13 @@ from app.tasks.note_contracts import (
     task_note_detection_json_schema,
 )
 from app.tasks.note_prompt import build_task_note_detection_input
+from app.tasks.query_contracts import (
+    TaskQueryOutputError,
+    TaskQueryIntent,
+    parse_task_query_json,
+    task_query_json_schema,
+)
+from app.tasks.query_prompt import build_task_query_input
 
 
 class ModelProviderError(RuntimeError):
@@ -92,6 +99,15 @@ class TaskReviewDetectionCall:
 @dataclass(frozen=True, slots=True)
 class TaskNoteDetectionCall:
     result: TaskNoteDetectionResult
+    model: str
+    response_format: str
+    request_id: str | None
+    usage: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskQueryDetectionCall:
+    result: TaskQueryIntent
     model: str
     response_format: str
     request_id: str | None
@@ -338,6 +354,59 @@ class OpenAICompatibleTaskDetector:
                 f"模型任务说明输出未通过本地契约校验：{exc}"
             ) from exc
         return TaskNoteDetectionCall(
+            result=result,
+            model=self._response_model(payload),
+            response_format=mode,
+            request_id=response.headers.get("x-request-id"),
+            usage=self._usage(payload),
+        )
+
+    def detect_task_query(
+        self,
+        text: str,
+        *,
+        chat_type: str,
+        sender_name: str | None = None,
+    ) -> TaskQueryDetectionCall:
+        """Classify one read-only natural-language task query."""
+
+        model_input = build_task_query_input(
+            text,
+            chat_type=chat_type,
+            sender_name=sender_name,
+        )
+        schema = task_query_json_schema()
+        response = self._chat_completion(
+            mode="json_schema",
+            schema_name="task_query_detection",
+            schema=schema,
+            model_input=model_input,
+            # Reasoning models may spend completion tokens on an internal
+            # reasoning field before emitting the small JSON result.
+            max_tokens=600,
+        )
+        mode = "json_schema"
+        if response.status_code in {400, 422}:
+            response = self._chat_completion(
+                mode="json_object",
+                schema_name="task_query_detection",
+                schema=schema,
+                model_input=model_input,
+                max_tokens=600,
+            )
+            mode = "json_object"
+        if not response.is_success:
+            raise self._http_error(response)
+
+        payload = self._response_json(response)
+        content = self._message_content(payload)
+        try:
+            result = parse_task_query_json(content)
+        except TaskQueryOutputError as exc:
+            raise ModelProviderError(
+                f"模型任务查询输出未通过本地契约校验：{exc}"
+            ) from exc
+        return TaskQueryDetectionCall(
             result=result,
             model=self._response_model(payload),
             response_format=mode,

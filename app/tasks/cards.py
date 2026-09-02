@@ -20,22 +20,35 @@ def build_private_task_list_card(
     *,
     is_admin: bool,
     actions_enabled: bool = False,
+    subject_name: str | None = None,
 ) -> CardPayload:
     """Build a read-only card from an already-authorized task-list page."""
 
-    title = "全部未完成任务" if is_admin else "我的未完成任务"
+    title = (
+        f"{subject_name}的未完成任务"
+        if subject_name
+        else "全部未完成任务"
+        if is_admin
+        else "我的未完成任务"
+    )
     elements: list[CardPayload] = []
     if page.total_count == 0:
         empty_text = (
-            "当前配置群中没有未完成任务。"
+            f"{subject_name}当前没有未完成任务。"
+            if subject_name
+            else "当前配置群中没有未完成任务。"
             if is_admin
             else "你当前没有未完成任务。"
         )
         elements.append(_markdown(f"📭 **{empty_text}**"))
     else:
-        view_note = "管理员视图" if is_admin else "个人视图"
+        view_note = (
+            f"{subject_name} · 共 **{page.total_count}** 项"
+            if subject_name
+            else "管理员视图" if is_admin else "个人视图"
+        )
         elements.append(
-            _markdown(f"{view_note} · 共 **{page.total_count}** 项")
+            _markdown(view_note)
         )
         for index, entry in enumerate(page.entries, start=1):
             if index > 1:

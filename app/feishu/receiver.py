@@ -288,6 +288,7 @@ def start_listener(
     management_commands: ManagementCommandProcessor | None = None,
     note_commands: PrivateTaskNoteCommandProcessor | None = None,
     review_commands: PrivateReviewCommandProcessor | None = None,
+    query_detector: object | None = None,
 ) -> None:
     """Start the blocking Feishu WebSocket listener."""
 
@@ -331,6 +332,8 @@ def start_listener(
                         else None
                     ),
                     chat_administrators=chat_administrator_repository,
+                    alias_repository=alias_repository,
+                    query_detector=query_detector,
                 )
             if (
                 chat_administrator_repository is not None

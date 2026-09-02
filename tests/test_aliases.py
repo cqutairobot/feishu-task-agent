@@ -7,9 +7,15 @@ from tempfile import TemporaryDirectory
 import unittest
 from zoneinfo import ZoneInfo
 
-from app.database.engine import create_database_engine, create_session_factory
+from sqlalchemy import select
+
+from app.database.engine import (
+    create_database_engine,
+    create_session_factory,
+    session_scope,
+)
 from app.database.migrate import upgrade_database
-from app.database.models import User
+from app.database.models import Chat, ChatMembership, User
 from app.database.repository import MessageRepository
 from app.identity.aliases import AliasConflictError, AliasError, AliasRepository
 from app.ingestion.service import MessageIngestionService
@@ -138,6 +144,132 @@ class AliasRepositoryTest(unittest.TestCase):
 
         with self.assertRaisesRegex(AliasError, "has not sent"):
             self.aliases.bind("oc_test", "ou_unobserved", "未发言成员")
+
+    def test_administrator_can_bind_active_member_without_observed_message(self) -> None:
+        with self.session_factory() as session:
+            session.add(
+                User(
+                    open_id="ou_directory_only",
+                    union_id=None,
+                    name="目录成员",
+                    tenant_key="tenant_test",
+                    last_seen_at=self.received_at,
+                    created_at=self.received_at,
+                    updated_at=self.received_at,
+                )
+            )
+            session.add(
+                ChatMembership(
+                    chat_id="oc_test",
+                    open_id="ou_directory_only",
+                    display_name_snapshot="目录成员",
+                    active=True,
+                    is_owner=False,
+                    first_synced_at=self.received_at,
+                    last_synced_at=self.received_at,
+                    left_at=None,
+                )
+            )
+            session.commit()
+
+        binding = self.aliases.bind_for_administrator(
+            "oc_test", "ou_directory_only", "目录成员"
+        )
+
+        self.assertEqual(binding.source, "administrator_page")
+        self.assertEqual(binding.alias, "目录成员")
+
+    def test_resolves_confirmed_names_only_for_active_members_in_scope(self) -> None:
+        self.messages.apply_directory_snapshot(
+            "oc_test",
+            "实验群",
+            {
+                "ou_test": "王政",
+                "ou_directory_only": "目录成员",
+            },
+            owner_open_id="ou_test",
+            authoritative_members=True,
+            updated_at=self.received_at,
+        )
+        self.aliases.bind("oc_test", "ou_test", "王政")
+        self.aliases.bind_for_administrator(
+            "oc_test", "ou_directory_only", "目录成员"
+        )
+
+        self.assertEqual(
+            self.aliases.resolve_open_ids_across_chats(
+                "王政", chat_ids=frozenset({"oc_test"})
+            ),
+            frozenset({"ou_test"}),
+        )
+        self.assertEqual(
+            self.aliases.resolve_open_ids_across_chats(
+                "目录成员", chat_ids=frozenset({"oc_test"})
+            ),
+            frozenset({"ou_directory_only"}),
+        )
+        with session_scope(self.session_factory) as session:
+            membership = session.scalar(
+                select(ChatMembership).where(
+                    ChatMembership.chat_id == "oc_test",
+                    ChatMembership.open_id == "ou_directory_only",
+                )
+            )
+            membership.active = False
+            membership.left_at = self.received_at
+
+        self.assertEqual(
+            self.aliases.resolve_open_ids_across_chats(
+                "目录成员", chat_ids=frozenset({"oc_test"})
+            ),
+            frozenset(),
+        )
+
+    def test_cross_chat_resolution_reports_distinct_people_and_honors_enabled_groups(self) -> None:
+        other = self._event(
+            event_id="evt_other_chat",
+            message_id="om_other_chat",
+            open_id="ou_other",
+            chat_id="oc_other",
+        )
+        self.ingestion.process_payload(other, received_at=self.received_at)
+        self.messages.apply_directory_snapshot(
+            "oc_test",
+            "实验群",
+            {"ou_test": "王政"},
+            owner_open_id="ou_test",
+            authoritative_members=True,
+            updated_at=self.received_at,
+        )
+        self.messages.apply_directory_snapshot(
+            "oc_other",
+            "另一个群",
+            {"ou_other": "王政"},
+            owner_open_id="ou_other",
+            authoritative_members=True,
+            updated_at=self.received_at,
+        )
+        self.aliases.bind("oc_test", "ou_test", "王政")
+        self.aliases.bind("oc_other", "ou_other", "王政")
+
+        self.assertEqual(
+            self.aliases.resolve_open_ids_across_chats("王政"),
+            frozenset({"ou_test", "ou_other"}),
+        )
+        self.assertEqual(
+            self.aliases.resolve_open_ids_across_chats(
+                "王政", chat_ids=frozenset({"oc_test"})
+            ),
+            frozenset({"ou_test"}),
+        )
+
+        with session_scope(self.session_factory) as session:
+            session.get(Chat, "oc_other").enabled = False
+
+        self.assertEqual(
+            self.aliases.resolve_open_ids_across_chats("王政"),
+            frozenset({"ou_test"}),
+        )
 
     def test_can_find_sender_from_copied_message_id(self) -> None:
         sender = self.aliases.sender_for_message("om_test")

@@ -92,6 +92,9 @@ test("browser API requests rely on the HttpOnly session cookie", async () => {
   assert.match(source, /NEXT_PUBLIC_MANAGEMENT_API_URL \?\? ""/);
   assert.match(source, /\/api\/chats/);
   assert.match(source, /飞书名称：/);
+  assert.match(source, /成员权限与任务姓名/);
+  assert.match(source, /管理员可直接设置/);
+  assert.match(source, /members\/\$\{encodeURIComponent\(member\.open_id\)\}\/alias/);
   assert.match(source, /resource: "deadline" \| "title" \| "assignees" \| "status"/);
   assert.match(source, /\/tasks\/\$\{taskId\}\/\$\{resource\}/);
   assert.match(source, /mutateTask\("deadline"/);

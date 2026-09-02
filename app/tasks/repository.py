@@ -34,6 +34,7 @@ from app.database.models import (
     DetectionMaterialization,
     DetectionRun,
     DetectionRunFocusMessage,
+    ChatMembership,
     Message,
     Task,
     TaskAssignee,
@@ -649,6 +650,26 @@ class TaskRepository:
                 .limit(1)
             )
             if observed is None:
+                # An administrator may have assigned a confirmed task name
+                # to a directory member who has not spoken in this chat yet.
+                # The detection context already grounds the candidate in that
+                # alias; require current membership instead of a historical
+                # message in this case. Members no longer in the chat still
+                # fail closed below.
+                active_membership = session.scalar(
+                    select(ChatMembership.id)
+                    .where(
+                        ChatMembership.chat_id == job.chat_id,
+                        ChatMembership.open_id == open_id,
+                        ChatMembership.active.is_(True),
+                    )
+                    .limit(1)
+                )
+                if active_membership is not None:
+                    participants.append(
+                        ContextParticipant(open_id=open_id, name=name)
+                    )
+                    continue
                 raise TaskMaterializationError(
                     f"candidate owner {open_id} was never observed in job chat"
                 )
